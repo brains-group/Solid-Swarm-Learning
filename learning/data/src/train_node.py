@@ -65,31 +65,53 @@ class SwarmNode:
         self.criterion = nn.BCELoss() 
 
     def train_local_epoch(self):
-        print(f"\n[Client {self.client_id}] Starting local training with Negative Sampling...")
-        train_path = os.path.join(self.pod_dir, 'train.csv')
+        # 1. READ BLOCKCHAIN STATE: Should we exclude vulnerable data?
+        exclude_vuln = self.contract.functions.excludeVulnerableData(self.wallet_address).call()
+        status_msg = "EXCLUDING" if exclude_vuln else "INCLUDING"
+        print(f"\n[Client {self.client_id}] Local training... Privacy Flag is {status_msg} vulnerable data.")
+
+        # 2. LOCATE FILES
+        common_path = os.path.join(self.pod_dir, 'train_common.csv')
+        vuln_path = os.path.join(self.pod_dir, 'train_vulnerable.csv')
         test_path = os.path.join(self.pod_dir, 'test.csv')
         
-        if not os.path.exists(train_path):
-            print(f"[Client {self.client_id}] No train.csv found. Skipping training.")
+        if not os.path.exists(common_path):
+            print(f"[Client {self.client_id}] No train_common.csv found. Skipping.")
             return
 
-        train_df = pd.read_csv(train_path)
+        # 3. DYNAMICALLY BUILD THE DATAFRAME
+        train_df = pd.read_csv(common_path)
+        
+        if not exclude_vuln and os.path.exists(vuln_path):
+            # If the user permits it, concatenate the vulnerable data
+            vuln_df = pd.read_csv(vuln_path)
+            train_df = pd.concat([train_df, vuln_df], ignore_index=True)
+
         if train_df.empty:
-            print(f"[Client {self.client_id}] train.csv is empty. Skipping training.")
+            print(f"[Client {self.client_id}] Active training data is empty. Skipping.")
             return
 
-        # 1. Build the "Forbidden List" to prevent Data Leakage
+        # 4. Build the "Forbidden List" to prevent Data Leakage
+        # Start with the data we are actively training on
         global_seen_set = set(train_df['recipe_id'].values)
+        
+        # Make sure to also forbid the vulnerable data even if we aren't training on it,
+        # so we don't accidentally use it as a negative sample and punish the model for it!
+        if exclude_vuln and os.path.exists(vuln_path):
+            vuln_df = pd.read_csv(vuln_path)
+            global_seen_set.update(vuln_df['recipe_id'].values)
+            
+        # Add the test set to the forbidden list
         if os.path.exists(test_path):
             test_df = pd.read_csv(test_path)
             if not test_df.empty:
                 global_seen_set.update(test_df['recipe_id'].values)
 
-        # 2. Get the actual interactions and their labels
+        # 5. Get the actual interactions and their labels
         pos_recipes = train_df['recipe_id'].values % TOTAL_RECIPES
         pos_labels = (train_df['rating'].values >= 4).astype(float)
         
-        # 3. Generate Strict Negative Samples
+        # 6. Generate Strict Negative Samples
         num_interactions = len(train_df)
         neg_recipes_list = []
         
@@ -101,15 +123,15 @@ class SwarmNode:
         neg_recipes = np.array(neg_recipes_list)
         neg_labels = np.zeros(num_interactions) # Label as 0 (Dislike/Irrelevant)
         
-        # 4. Combine Real data with Fake data
+        # 7. Combine Real data with Fake data
         all_recipes = np.concatenate([pos_recipes, neg_recipes])
         all_labels = np.concatenate([pos_labels, neg_labels])
         
-        # 5. Convert to PyTorch Tensors
+        # 8. Convert to PyTorch Tensors
         recipes_tensor = torch.tensor(all_recipes, dtype=torch.long)
         labels_tensor = torch.tensor(all_labels, dtype=torch.float32).unsqueeze(1)
 
-        # 6. Create PyTorch DataLoader for batching
+        # 9. Create PyTorch DataLoader for batching
         dataset = TensorDataset(recipes_tensor, labels_tensor)
         dataloader = DataLoader(dataset, batch_size=64, shuffle=True)
 

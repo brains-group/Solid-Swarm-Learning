@@ -24,6 +24,12 @@ contract SwarmCoordinator {
     // General registration status of a node address
     mapping(address => bool) public isNodeRegistered;
 
+    // NEW: On-chain privacy flag. If true, the node will exclude its vulnerable data.
+    mapping(address => bool) public excludeVulnerableData;
+
+    // NEW: Event to log when a user changes their privacy preference
+    event PrivacyPreferenceUpdated(address indexed nodeAddress, bool isExcluded);
+
     // Mapping from Swarm ID to the Swarm's state
     mapping(uint256 => Swarm) public swarms;
 
@@ -58,6 +64,13 @@ contract SwarmCoordinator {
         }
         
         emit NodeRegistered(msg.sender, _swarmIds);
+    }
+
+    // NEW: Function for a node to toggle its vulnerable data sharing on or off
+    function setPrivacyPreference(bool _exclude) external {
+        require(isNodeRegistered[msg.sender], "Not a registered node");
+        excludeVulnerableData[msg.sender] = _exclude;
+        emit PrivacyPreferenceUpdated(msg.sender, _exclude);
     }
 
     // 2. Nodes call this for each swarm they are a part of when they finish local training

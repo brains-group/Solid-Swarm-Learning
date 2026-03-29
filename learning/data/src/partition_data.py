@@ -257,6 +257,9 @@ def main():
         
         # 80/20 Train/Test split for local evaluation
         train_df, test_df = train_test_split(user_data, test_size=0.2, random_state=42)
+
+        # NEW: Split the training data into 70% Common and 30% Vulnerable
+        train_common, train_vulnerable = train_test_split(train_df, test_size=0.3, random_state=42)
         
         # Generate the taste profile for the smart contract
         profile = extract_taste_profile(user_data, recipes, user_id, ingredient_map)
@@ -265,7 +268,8 @@ def main():
             swarm_id_counts[swarm_id] = swarm_id_counts.get(swarm_id, 0) + 1
         
         # Write to the simulated pod
-        train_df.to_csv(os.path.join(client_dir, 'train.csv'), index=False)
+        train_common.to_csv(os.path.join(client_dir, 'train_common.csv'), index=False)
+        train_vulnerable.to_csv(os.path.join(client_dir, 'train_vulnerable.csv'), index=False)
         test_df.to_csv(os.path.join(client_dir, 'test.csv'), index=False)
         
         with open(os.path.join(client_dir, 'profile.json'), 'w') as f:

@@ -2,7 +2,7 @@
 
 This project implements a decentralized machine learning system for building a food recommendation model using Swarm Learning. The system is orchestrated by a Solidity smart contract on an Ethereum-like blockchain (Anvil) and executed by a network of Python-based client nodes.
 
-## Intended Project Structure
+## Project Structure
 
 ```
 food_swarm_project/
@@ -20,7 +20,8 @@ food_swarm_project/
         ├── pods/               # Isolated client data & model storage
         │   ├── client_1/
         │   │   ├── profile.json
-        │   │   ├── train.csv
+        │   │   ├── train_common.csv # common data that is always included in swarm
+                ├── vulnerable.csv # vulnerable data the user can choose to exclude
         │   │   └── test.csv
         │   └── ... (client_2, client_3, etc.)
         │
@@ -83,31 +84,6 @@ Because evaluation cannot happen centrally without compromising privacy, it is p
 
 ---
 
-## Setup Steps
-
-1) Initialize the Environment: Set up your Forge project to house the smart contracts.
-
-forge init swarm_orchestrator
-cd swarm_orchestrator
-
-2) Move the SwarmCoordinator contract into forge's src
-
-3) install dependencies according to requirements.txt
-
-torch
-pandas
-numpy
-web3
-scikit-learn
-
-(please let me know if I'm missing any that I should add)
-
-4) obtain the requirered datasets (either through github or through me/Fernando)
-
-IMPORTANT: PP_recipes.csv, RAW_interactions.csv, and RAW_recipes.csv are too big to push on github, if they are needed for the project reach out to me or Fernando for them, and be sure to put them into the global folder
-
----
-
 ## 🚀 Quick Start & Execution
 
 To simulate the complete decentralized network locally, you will need to open four separate terminal windows to orchestrate the different components of the stack.
@@ -122,7 +98,7 @@ anvil
 Deploy the Smart Contract that will orchestrate the swarm leader elections and epoch transitions.
 
 cd swarm_orchestrator
-forge script script/Deploy_SC.sol --rpc-url [http://127.0.0.1:8545](http://127.0.0.1:8545) --broadcast
+forge script script/Deploy_SC.sol --rpc-url http://127.0.0.1:8545 --broadcast
 
 ### Terminal 3: Launch the Swarm Monitor
 
@@ -160,7 +136,14 @@ The network reports two primary categories of metrics to prove its efficacy:
 
     Recommendation (Ranking): Hit Ratio (HR@10) and Normalized Discounted Cumulative Gain (NDCG@10) using a Leave-One-Out methodology mixed with 99 un-interacted negative samples.
 
+### Terminal 5: The Vulnerable Edge Data
 
+This terminal is where you can control each pod's vulnerability status via toggle_privacy.py, telling the blockchain whether to include or exclude a user's vulnerable data. This code can also be run during the swarming process as well
+
+cd learning/data/src
+python3 toggle_privacy.py pod_number include/exclude
+
+---
 
 
 
