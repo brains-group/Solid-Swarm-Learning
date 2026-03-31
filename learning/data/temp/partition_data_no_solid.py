@@ -5,8 +5,6 @@ from sklearn.model_selection import train_test_split
 import ast
 import re
 from config import NUM_ACTIVE_CLIENTS
-import json
-from solid_integration import SolidTokenClient
 
 # Configuration
 MIN_INTERACTIONS = 20
@@ -227,16 +225,6 @@ def extract_taste_profile(user_interactions, recipes_df, user_id, ingredient_map
     }
 
 def main():
-    # 1. LOAD THE MASTER CREDENTIALS FILE
-    # Adjust this path based on where you save user_accounts.json
-    accounts_path = "../../../secret/user_accounts.json"
-    try:
-        with open(accounts_path, 'r') as f:
-            user_accounts = json.load(f)
-    except FileNotFoundError:
-        print(f"❌ Error: Cannot find {accounts_path}. Please ensure the Node.js backend credentials exist.")
-        return
-
     print("Loading global datasets...")
     # Assuming you downloaded RAW_interactions.csv and PP_recipes.csv
     interactions = pd.read_csv(os.path.join(GLOBAL_DATA_DIR, 'RAW_interactions.csv'))
@@ -259,66 +247,36 @@ def main():
     # Limit to our simulation size
     selected_users = valid_users[:NUM_ACTIVE_CLIENTS]
 
-    print(f"Partitioning data and provisioning Solid Pods for {NUM_ACTIVE_CLIENTS} clients...")
+    print(f"Partitioning data for {NUM_ACTIVE_CLIENTS} clients based on mixed taste profiles...")
     swarm_id_counts = {}
-
     for idx, user_id in enumerate(selected_users):
-        client_num = idx + 1
-        client_dir = setup_directories(client_num)
+        client_dir = setup_directories(idx + 1)
         
-        # 2. MATCH PYTHON CLIENT TO SOLID USER (client_1 -> user1)
-        solid_user_key = f"user{client_num}"
-        if solid_user_key not in user_accounts:
-            print(f"⚠️ Warning: No credentials found for {solid_user_key} in JSON. Skipping.")
-            continue
-            
-        credentials = user_accounts[solid_user_key]
-        
-        # Isolate and split the user's data
+        # Isolate the user's data
         user_data = interactions[interactions['user_id'] == user_id]
+        
+        # 80/20 Train/Test split for local evaluation
         train_df, test_df = train_test_split(user_data, test_size=0.2, random_state=42)
+
+        # NEW: Split the training data into 70% Common and 30% Vulnerable
         train_common, train_vulnerable = train_test_split(train_df, test_size=0.3, random_state=42)
         
-        # Generate the taste profile
+        # Generate the taste profile for the smart contract
         profile = extract_taste_profile(user_data, recipes, user_id, ingredient_map)
-
+        
         for swarm_id in profile['swarm_ids']:
             swarm_id_counts[swarm_id] = swarm_id_counts.get(swarm_id, 0) + 1
         
-        # 3. INJECT SOLID CREDENTIALS INTO THE LOCAL PROFILE
-        profile['solid_pod_url'] = credentials['pod'].replace(f"/{solid_user_key}/", "") # e.g., http://localhost:3000
-        profile['solid_username'] = solid_user_key
-        profile['solid_token_id'] = credentials['client_credentials_token_identifier']
-        profile['solid_token_secret'] = credentials['client_credentials_token_secret']
-        
-        # Save locally first
-        train_common_path = os.path.join(client_dir, 'train_common.csv')
-        train_vuln_path = os.path.join(client_dir, 'train_vulnerable.csv')
-        test_path = os.path.join(client_dir, 'test.csv')
-        
-        train_common.to_csv(train_common_path, index=False)
-        train_vulnerable.to_csv(train_vuln_path, index=False)
-        test_df.to_csv(test_path, index=False)
+        # Write to the simulated pod
+        train_common.to_csv(os.path.join(client_dir, 'train_common.csv'), index=False)
+        train_vulnerable.to_csv(os.path.join(client_dir, 'train_vulnerable.csv'), index=False)
+        test_df.to_csv(os.path.join(client_dir, 'test.csv'), index=False)
         
         with open(os.path.join(client_dir, 'profile.json'), 'w') as f:
             json.dump(profile, f, indent=4)
             
-        # 4. UPLOAD TO THE REAL SOLID POD
-        print(f"\nProvisioning Solid Pod for {solid_user_key}...")
-        solid_client = SolidTokenClient(
-            pod_url=profile['solid_pod_url'],
-            username=profile['solid_username'],
-            token_id=profile['solid_token_id'],
-            token_secret=profile['solid_token_secret']
-        )
-        
-        if solid_client.authenticate():
-            solid_client.create_container("/swarm_data/")
-            solid_client.upload_file(train_common_path, "/swarm_data/train_common.csv")
-            solid_client.upload_file(train_vuln_path, "/swarm_data/train_vulnerable.csv")
-            solid_client.upload_file(test_path, "/swarm_data/test.csv")
-        
-        print(f"✓ Client {client_num} fully provisioned.")
+        print(f"Client {idx + 1} provisioned. Swarm IDs: {profile['swarm_ids']}, Taste Profiles: {profile['taste_profiles']}, Interactions: {len(user_data)}")
+        print(f"    Full Score Breakdown: {profile['debug_taste_scores']}\n")
 
     print("\n--- Swarm Assignment Summary ---")
     SWARM_ID_TO_TASTE = {v: k for k, v in TASTE_TO_SWARM_ID.items()}

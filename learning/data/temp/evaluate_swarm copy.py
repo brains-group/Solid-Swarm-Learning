@@ -4,7 +4,7 @@ import torch.nn as nn
 import pandas as pd
 import numpy as np
 from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
-from config import NUM_ACTIVE_CLIENTS, TOTAL_EPOCHS
+from config import NUM_ACTIVE_CLIENTS, TOTAL_EPOCHS, TOTAL_RECIPES
 
 # --- Configuration ---
 PODS_DIR = "../pods"
@@ -12,7 +12,7 @@ GLOBAL_DIR = "../global"
 
 # --- Model Definition (Must exactly match train_node.py) ---
 class FoodRecommender(nn.Module):
-    def __init__(self, num_users=100000, num_recipes=500000, embedding_dim=32):
+    def __init__(self, num_users=NUM_ACTIVE_CLIENTS, num_recipes=TOTAL_RECIPES, embedding_dim=32):
         super(FoodRecommender, self).__init__()
         self.user_embedding = nn.Embedding(num_users, embedding_dim)
         self.recipe_embedding = nn.Embedding(num_recipes, embedding_dim)
@@ -60,8 +60,8 @@ def main():
         return
         
     # Prepare data for PyTorch
-    users = torch.tensor(combined_test_df['user_id'].values % 100000, dtype=torch.long)
-    recipes = torch.tensor(combined_test_df['recipe_id'].values % 500000, dtype=torch.long)
+    users = torch.tensor(combined_test_df['user_id'].values % NUM_ACTIVE_CLIENTS, dtype=torch.long)
+    recipes = torch.tensor(combined_test_df['recipe_id'].values % TOTAL_RECIPES, dtype=torch.long)
     
     # Convert actual ratings to binary labels: 1 if rating is 4 or 5 ("Liked"), else 0 ("Disliked")
     actual_labels_tensor = torch.tensor((combined_test_df['rating'].values >= 4).astype(float), dtype=torch.float32).unsqueeze(1)
