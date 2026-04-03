@@ -5,23 +5,59 @@ import pandas as pd
 import numpy as np
 import math
 from sklearn.metrics import confusion_matrix
+import torch.nn.functional as F
+
 from config import NUM_ACTIVE_CLIENTS, TOTAL_EPOCHS, TOP_N, NUM_NEGATIVE_SAMPLES, TOTAL_RECIPES
 
 # --- Configuration ---
 PODS_DIR = "../pods"
 GLOBAL_DIR = "../global"
 
-# --- Decentralized Model Definition ---
+# --- Decentralized Model Definition with the new HighwayLayer class ---F
+
+class HighwayLayer(nn.Module):
+    def __init__(self, size, gate_bias=-1.0):
+        super(HighwayLayer, self).__init__()
+        self.transform = nn.Linear(size, size)
+        self.gate = nn.Linear(size, size)
+        nn.init.constant_(self.gate.bias, gate_bias)
+
+    def forward(self, x):
+        h = F.relu(self.transform(x))
+        t = torch.sigmoid(self.gate(x))
+        c = 1.0 - t
+        return h * t + x * c
+
 class DecentralizedFoodRecommender(nn.Module):
-    def __init__(self, num_recipes=TOTAL_RECIPES, embedding_dim=32):
+    def __init__(self, num_recipes=TOTAL_RECIPES, embedding_dim=32, num_highway_layers=2):
         super(DecentralizedFoodRecommender, self).__init__()
-        self.my_personal_embedding = nn.Parameter(torch.randn(1, embedding_dim))
+        
+        self.my_personal_embedding = nn.Parameter(torch.randn(1, embedding_dim) * 0.1)
         self.recipe_embedding = nn.Embedding(num_recipes, embedding_dim)
+        self.recipe_embedding.weight.data.normal_(0, 0.1)
+
+        input_dim = embedding_dim * 2
+        
+        self.highway_layers = nn.ModuleList([
+            HighwayLayer(input_dim) for _ in range(num_highway_layers)
+        ])
+        
+        self.output = nn.Linear(input_dim, 1)
+        self.dropout = nn.Dropout(0.2)
 
     def forward(self, recipe_idx):
         r = self.recipe_embedding(recipe_idx)
-        scores = torch.sum(self.my_personal_embedding * r, dim=1)
-        return torch.sigmoid(scores).unsqueeze(1)
+        batch_size = r.size(0)
+        u = self.my_personal_embedding.expand(batch_size, -1)
+        
+        x = torch.cat([u, r], dim=1)
+        
+        for layer in self.highway_layers:
+            x = layer(x)
+            x = self.dropout(x)
+            
+        scores = self.output(x)
+        return torch.sigmoid(scores)
 
 def main():
     print("📊 Initializing Unified Decentralized Swarm Evaluation...\n")

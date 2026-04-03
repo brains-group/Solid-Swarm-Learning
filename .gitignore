@@ -1,3 +1,4 @@
 data/global
 .env
 .DS_Store
+secret

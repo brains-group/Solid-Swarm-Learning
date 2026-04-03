@@ -102,32 +102,42 @@ To simulate the complete decentralized network locally, you will need to open fi
 ### Terminal 1: Boot Solid
 
 cd solid_backend
+rm -rf my-solid-data .internal
 npm start
 
-Important (and to improve later): as of now there is no easy way to create different Solid clients, so you must manually go to http://localhost:3000, create your user profiles with generated tokens, and place all of those credentials within user_accounts.json present within the secret folder (which currently has an example structure you can follow)
 
-This is why, unless absolutely necessary or if you're done with the project, you should never close this terminal
+be sure to remove stuff in my-solid-data so that old profiles don't mess with client generation in the future
 
-### Terminal 2: Boot the Blockchain
+### Terminal 2: Generate Solid Clients and Pods
+
+generate the specified number of solid clients through the js script:
+
+cd solid_backend/scripts
+
+node create_accounts.js
+
+results are saved within user_accounts.json within secret, which stores log-in info
+
+### Terminal 3: Boot the Blockchain
 Start the local Ethereum testnet. This will spin up your local ledger and generate test wallets.
 
 anvil
 
-### Terminal 3: Deploy the Coordinator Contract
+### Terminal 4: Deploy the Coordinator Contract
 
 Deploy the Smart Contract that will orchestrate the swarm leader elections and epoch transitions.
 
 cd swarm_orchestrator
 forge script script/Deploy_SC.sol --rpc-url http://127.0.0.1:8545 --broadcast
 
-### Terminal 4: Launch the Swarm Monitor
+### Terminal 5: Launch the Swarm Monitor
 
 Start the live dashboard to monitor node registrations, epoch progress, and leader elections in real-time.
 
 cd learning/data/src
 python3 monitor_swarm.py
 
-### Terminal 5: The Edge Nodes (Partition, Train, Evaluate)
+### Terminal 6: The Edge Nodes (Partition, Train, Evaluate)
 
 This terminal simulates the actions of the edge nodes (the clients/Pods). Run these commands in sequence:
 
@@ -158,12 +168,13 @@ The network reports two primary categories of metrics to prove its efficacy:
 
     Recommendation (Ranking): Hit Ratio (HR@10) and Normalized Discounted Cumulative Gain (NDCG@10) using a Leave-One-Out methodology mixed with 99 un-interacted negative samples.
 
-### Terminal 5: The Vulnerable Edge Data
+### Terminal 7: Edit Edge privacy
 
-This terminal is where you can control each pod's vulnerability status via toggle_privacy.py, telling the blockchain whether to include or exclude a user's vulnerable data. This code can also be run during the swarming process as well
+This terminal is where you can control each pod's vulnerability and DP status via the toggle scripts, telling the blockchain whether to include or exclude a user's vulnerable data/altering the amount of differential privacy involved for that node. This code can also be run during the swarming process as well
 
 cd learning/data/src
 python3 toggle_privacy.py pod_number include/exclude
+python3 toggle_dp.py pod_number dp_value
 
 ---
 

@@ -11,6 +11,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from solid_integration import SolidTokenClient
 from config import TOTAL_EPOCHS, TOTAL_RECIPES
 import numpy as np
+import torch.nn.functional as F
 
 # Absolute import to avoid relative import errors
 from config import TOTAL_EPOCHS 
@@ -24,28 +25,67 @@ ABI_PATH = "../../../swarm_orchestrator/out/SwarmCoordinator.sol/SwarmCoordinato
 GLOBAL_DIR = "../global"
 PODS_DIR = "../pods" 
 
-# --- Decentralized Top-N Model ---
+# --- Decentralized Top-N Model that implements Highway Networks---
+class HighwayLayer(nn.Module):
+    def __init__(self, size, gate_bias=-1.0):
+        super(HighwayLayer, self).__init__()
+        # H(x) - The non-linear transformation
+        self.transform = nn.Linear(size, size)
+        # T(x) - The transform gate
+        self.gate = nn.Linear(size, size)
+        
+        # Pro-Tip: Initialize the gate bias negatively so the layer 
+        # initially behaves like a simple pass-through (carry) connection.
+        nn.init.constant_(self.gate.bias, gate_bias)
+
+    def forward(self, x):
+        h = F.relu(self.transform(x))
+        t = torch.sigmoid(self.gate(x))
+        c = 1.0 - t  # Carry gate
+        
+        # Output is a dynamic blend of the transformed data and the raw input
+        return h * t + x * c
+
 class DecentralizedFoodRecommender(nn.Module):
-    def __init__(self, num_recipes=TOTAL_RECIPES, embedding_dim=32):
+    def __init__(self, num_recipes=TOTAL_RECIPES, embedding_dim=32, num_highway_layers=2):
         super(DecentralizedFoodRecommender, self).__init__()
         
-        # PRIVATE: This client's personal taste vector. 
-        # Stays trapped in the Solid Pod and is NEVER sent to the blockchain.
-        self.my_personal_embedding = nn.Parameter(torch.randn(1, embedding_dim))
-        
-        # PUBLIC: The shared understanding of how ingredients relate.
-        # This is the ONLY thing aggregated by the Swarm.
+        # 1. The Embeddings (Still using 0.1 scaling to prevent gradient death!)
+        self.my_personal_embedding = nn.Parameter(torch.randn(1, embedding_dim) * 0.1)
         self.recipe_embedding = nn.Embedding(num_recipes, embedding_dim)
+        self.recipe_embedding.weight.data.normal_(0, 0.1)
+
+        # 2. Highway Networks require input and output dimensions to match.
+        # Since we concatenate User (32) + Recipe (32), our dimension is 64.
+        input_dim = embedding_dim * 2
+        
+        # ModuleList ensures PyTorch registers the parameters of our custom layers
+        self.highway_layers = nn.ModuleList([
+            HighwayLayer(input_dim) for _ in range(num_highway_layers)
+        ])
+        
+        # 3. The Final Scoring Layer
+        self.output = nn.Linear(input_dim, 1)
+        self.dropout = nn.Dropout(0.2)
 
     def forward(self, recipe_idx):
-        # We only need the recipe index now, the user is intrinsic to the model
+        # Fetch global recipe embeddings
         r = self.recipe_embedding(recipe_idx)
         
-        # Dot product between the user's private taste and the recipe
-        scores = torch.sum(self.my_personal_embedding * r, dim=1)
+        # Expand the local user's private embedding to match batch size
+        batch_size = r.size(0)
+        u = self.my_personal_embedding.expand(batch_size, -1)
         
-        # Output shape [batch_size, 1] to match the BCELoss expected target shape
-        return torch.sigmoid(scores).unsqueeze(1)
+        # Concatenate: [batch_size, 64]
+        x = torch.cat([u, r], dim=1)
+        
+        # Route through the Highway architecture
+        for layer in self.highway_layers:
+            x = layer(x)
+            x = self.dropout(x)
+            
+        scores = self.output(x)
+        return torch.sigmoid(scores)
 
 class SwarmNode:
     def __init__(self, client_id):
@@ -108,7 +148,7 @@ class SwarmNode:
         # 1. READ BLOCKCHAIN STATE: Should we exclude vulnerable data?
         exclude_vuln = self.contract.functions.excludeVulnerableData(self.wallet_address).call()
         status_msg = "EXCLUDING" if exclude_vuln else "INCLUDING"
-        print(f"\n[Client {self.client_id}] Local training... Privacy Flag is {status_msg} vulnerable data.")
+        print(f"[Client {self.client_id}] Local training... Privacy Flag is {status_msg} vulnerable data.")
 
         # 2. LOCATE FILES
         common_path = os.path.join(self.pod_dir, 'train_common.csv')
@@ -173,17 +213,32 @@ class SwarmNode:
         # 8. Training Loop
         self.model.train()
         total_loss = 0.0
+
+        # 9. Take a snapshot of the global weights BEFORE the batch loop starts
+        global_weights = {name: param.clone().detach() for name, param in self.model.named_parameters()}
+        mu = 0.01 # FedProx penalty hyperparameter
         
         for batch_recipes, batch_labels in dataloader:
             self.optimizer.zero_grad()
             predictions = self.model(batch_recipes) 
-            loss = self.criterion(predictions, batch_labels)
+            base_loss = self.criterion(predictions, batch_labels)
+            
+            # Calculate the FedProx Penalty (L2 Norm)
+            proximal_term = 0.0
+            for name, param in self.model.named_parameters():
+                # Only penalize the public recipe weights, not the private user embedding!
+                if 'my_personal_embedding' not in name:
+                    proximal_term += (param - global_weights[name]).norm(2)
+            
+            # Add the penalty to the base loss
+            loss = base_loss + (mu / 2) * proximal_term
+
             loss.backward()
             self.optimizer.step()
             total_loss += loss.item()
             
         avg_loss = total_loss / len(dataloader)
-        print(f"[Client {self.client_id}] Local training complete. Avg Loss: {avg_loss:.4f}")
+        print(f"\n[Client {self.client_id}] Local training complete. Avg Loss: {avg_loss:.4f}")
 
     def sign_and_send(self, tx):
         signed_tx = self.w3.eth.account.sign_transaction(tx, private_key=self.private_key)
@@ -197,10 +252,28 @@ class SwarmNode:
         return receipt
 
     def submit_to_swarm(self, swarm_id, epoch):
+        # Fetch the user's DP Budget from the Smart Contract
+        scaled_dp_budget = self.contract.functions.dpBudgets(self.wallet_address).call()
+        
         # Strip out the private embedding BEFORE saving
         state_dict = self.model.state_dict()
         public_weights_only = {k: v for k, v in state_dict.items() if 'my_personal_embedding' not in k}
         
+        # Apply Local Differential Privacy (Continuous Epsilon)
+        if scaled_dp_budget > 0:
+            # Reverse the Solidity integer scaling back to a float
+            epsilon = scaled_dp_budget / 100.0
+            #print(f"   [Client {self.client_id}] 🛡️ Applying DP Noise (Epsilon: {epsilon})...")
+            
+            # The standard deviation is inversely proportional to epsilon.
+            # (Assuming a base sensitivity constant of 0.1 for the clipping bound)
+            std_dev = 0.1 / epsilon 
+            
+            for key in public_weights_only.keys():
+                noise = torch.randn_like(public_weights_only[key]) * std_dev
+                public_weights_only[key] += noise
+
+        # Save and Submit
         weights_uri = os.path.join(self.pod_dir, f"weights_s{swarm_id}_e{epoch}.pt")
         torch.save(public_weights_only, weights_uri)
 
@@ -229,7 +302,7 @@ class SwarmNode:
             # Condition 1: We are the leader!
             if current_leader == self.wallet_address:
                 self.execute_leader_duties(swarm_id, epoch)
-                break 
+                return epoch + 1 # Move to the next epoch normally
                 
             # Condition 2: Someone else was leader and updated the model
             elif global_uri:
@@ -245,7 +318,8 @@ class SwarmNode:
                         
                         # strict=False tells PyTorch to only update the public recipe weights
                         self.model.load_state_dict(global_state, strict=False)
-                        break 
+                        # FAST-FORWARD: Return the global epoch + 1 so the local loop catches up instantly!
+                        return global_epoch + 1 
             
             time.sleep(2)
 
@@ -296,10 +370,16 @@ class SwarmNode:
         global_swarm_id = 0
 
         # Step 2: Begin the Swarm Training Loop
-        for epoch in range(TOTAL_EPOCHS):
-            self.train_local_epoch()
-            self.submit_to_swarm(global_swarm_id, epoch)
-            self.wait_for_consensus(global_swarm_id, epoch)
+        # We changed this from a 'for' loop to a dynamic 'while' loop
+        current_epoch = 0
+        while current_epoch < TOTAL_EPOCHS:
+            # train harder locally to survive global dilution
+            #print(f"\n--- Starting Local Epochs for Global Round {epoch} ---")
+            for local_step in range(3): 
+                self.train_local_epoch()
+            self.submit_to_swarm(global_swarm_id, current_epoch)
+            # The node syncs, and the function returns the NEW epoch it should jump to
+            current_epoch = self.wait_for_consensus(global_swarm_id, current_epoch)
             
         # Step 3: Save the full private brain to the pod at the end of training for evaluation
         full_local_path = os.path.join(self.pod_dir, 'local_full_model.pt')
