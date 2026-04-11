@@ -43,7 +43,7 @@ def main():
             # Determine the live status of the swarm
             if total_expected == 0:
                 status = "Idle (No clients expected)"
-            elif nodes_submitted >= total_expected*0.8:
+            elif nodes_submitted >= total_expected: #change with tot
                 status = "AGGREGATING"
             else:
                 status = f"Waiting on {total_expected - nodes_submitted} nodes..."

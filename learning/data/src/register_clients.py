@@ -58,7 +58,7 @@ def main():
         fund_tx = {
             'nonce': w3.eth.get_transaction_count(whale_account.address),
             'to': new_account.address,
-            'value': w3.to_wei(100, 'ether'),
+            'value': w3.to_wei(174,'ether'),
             'gas': 21000,
             'gasPrice': w3.eth.gas_price
         }

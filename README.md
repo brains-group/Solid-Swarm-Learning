@@ -97,7 +97,13 @@ Furthermore, the given SwarmCoordinator.sol smart contract must be moved within 
 
 To simulate the complete decentralized network locally, you will need to open five separate terminal windows to orchestrate the different components of the stack.
 
+# Option 1
 
+simply run ./master_swarm.sh in one terminal
+
+To view progress, run monitor_swarm.py as described below in a second terminal
+
+# Option 2
 
 ### Terminal 1: Boot Solid
 

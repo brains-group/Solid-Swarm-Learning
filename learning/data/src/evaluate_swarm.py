@@ -1,169 +1,59 @@
 import os
-import torch
-import torch.nn as nn
 import pandas as pd
 import numpy as np
-import math
-from sklearn.metrics import confusion_matrix
-import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
-from config import NUM_ACTIVE_CLIENTS, TOTAL_EPOCHS, TOP_N, NUM_NEGATIVE_SAMPLES, TOTAL_RECIPES
+from config import NUM_ACTIVE_CLIENTS, TOTAL_EPOCHS, TOP_N
 
-# --- Configuration ---
 PODS_DIR = "../pods"
 GLOBAL_DIR = "../global"
 
-# --- Decentralized Model Definition with the new HighwayLayer class ---F
-
-class HighwayLayer(nn.Module):
-    def __init__(self, size, gate_bias=-1.0):
-        super(HighwayLayer, self).__init__()
-        self.transform = nn.Linear(size, size)
-        self.gate = nn.Linear(size, size)
-        nn.init.constant_(self.gate.bias, gate_bias)
-
-    def forward(self, x):
-        h = F.relu(self.transform(x))
-        t = torch.sigmoid(self.gate(x))
-        c = 1.0 - t
-        return h * t + x * c
-
-class DecentralizedFoodRecommender(nn.Module):
-    def __init__(self, num_recipes=TOTAL_RECIPES, embedding_dim=32, num_highway_layers=2):
-        super(DecentralizedFoodRecommender, self).__init__()
-        
-        self.my_personal_embedding = nn.Parameter(torch.randn(1, embedding_dim) * 0.1)
-        self.recipe_embedding = nn.Embedding(num_recipes, embedding_dim)
-        self.recipe_embedding.weight.data.normal_(0, 0.1)
-
-        input_dim = embedding_dim * 2
-        
-        self.highway_layers = nn.ModuleList([
-            HighwayLayer(input_dim) for _ in range(num_highway_layers)
-        ])
-        
-        self.output = nn.Linear(input_dim, 1)
-        self.dropout = nn.Dropout(0.2)
-
-    def forward(self, recipe_idx):
-        r = self.recipe_embedding(recipe_idx)
-        batch_size = r.size(0)
-        u = self.my_personal_embedding.expand(batch_size, -1)
-        
-        x = torch.cat([u, r], dim=1)
-        
-        for layer in self.highway_layers:
-            x = layer(x)
-            x = self.dropout(x)
-            
-        scores = self.output(x)
-        return torch.sigmoid(scores)
-
 def main():
-    print("📊 Initializing Unified Decentralized Swarm Evaluation...\n")
-    
-    swarm_id = 0 
-    global_model_path = os.path.join(GLOBAL_DIR, f"global_model_s{swarm_id}_e{TOTAL_EPOCHS - 1}.pt")
-    
-    if not os.path.exists(global_model_path):
-        print(f"Global model not found at {global_model_path}. Exiting.")
-        return
-
+    print("📊 Aggregating Per-Epoch Classification and Final Ranking Stats...\n")
     print(f"{'='*60}")
-    print(f"--- Simulating Edge Evaluation across {NUM_ACTIVE_CLIENTS} Pods ---")
+    print(f"--- Fetching Evaluation Data for {NUM_ACTIVE_CLIENTS} Pods ---")
     
-    # 1. Global Classification Trackers
-    global_tp, global_tn, global_fp, global_fn = 0, 0, 0, 0
+    all_metrics = []
+    all_ranking = []
     
-    # 2. Global Ranking Trackers
-    global_hits = 0
-    global_ndcg = 0
-    total_ranking_tests = 0
-
     for client_id in range(1, NUM_ACTIVE_CLIENTS + 1):
         pod_dir = os.path.join(PODS_DIR, f"client_{client_id}")
-        test_path = os.path.join(pod_dir, 'test.csv')
-        train_path = os.path.join(pod_dir, 'train.csv')
-        local_model_path = os.path.join(pod_dir, 'local_full_model.pt')
+        metrics_path = os.path.join(pod_dir, 'metrics.csv')
+        ranking_path = os.path.join(pod_dir, 'final_ranking.csv')
         
-        if not (os.path.exists(test_path) and os.path.exists(local_model_path)):
-            continue
+        if os.path.exists(metrics_path):
+            df = pd.read_csv(metrics_path)
+            df['client_id'] = client_id
+            all_metrics.append(df)
             
-        test_df = pd.read_csv(test_path)
-        train_df = pd.read_csv(train_path) if os.path.exists(train_path) else pd.DataFrame(columns=['recipe_id'])
-        
-        if test_df.empty:
-            continue
+        if os.path.exists(ranking_path):
+            rdf = pd.read_csv(ranking_path)
+            all_ranking.append(rdf)
 
-        # Initialize the model for this specific client
-        local_model = DecentralizedFoodRecommender()
-        local_model.load_state_dict(torch.load(local_model_path, weights_only=True))
-        global_state = torch.load(global_model_path, weights_only=True)
-        local_model.load_state_dict(global_state, strict=False)
-        local_model.eval()
-        
-        # =========================================================
-        # PHASE 1: Classification Evaluation (Thresholding)
-        # =========================================================
-        recipes_tensor = torch.tensor(test_df['recipe_id'].values % TOTAL_RECIPES, dtype=torch.long)
-        y_true = (test_df['rating'].values >= 4).astype(float)
+    if not all_metrics:
+        print("⚠️ No metrics data found. Ensure that training has completed and clients have written 'metrics.csv'.")
+        return
 
-        with torch.no_grad():
-            preds = local_model(recipes_tensor).squeeze().numpy()
-            
-            # Handle edge case where a user only has 1 item in their test set
-            if preds.ndim == 0: 
-                preds = np.expand_dims(preds, 0)
-                
-            y_pred = (preds >= 0.5).astype(float)
+    combined_df = pd.concat(all_metrics, ignore_index=True)
+    epoch_stats = combined_df.groupby('epoch').sum().reset_index()
 
-        cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-        tn, fp, fn, tp = cm.ravel()
+    epochs = epoch_stats['epoch'].values
+    global_tp = epoch_stats['tp'].values
+    global_tn = epoch_stats['tn'].values
+    global_fp = epoch_stats['fp'].values
+    global_fn = epoch_stats['fn'].values
 
-        global_tn += tn
-        global_fp += fp
-        global_fn += fn
-        global_tp += tp
+    total_classifications = global_tp + global_tn + global_fp + global_fn
+    
+    accuracy = np.divide(global_tp + global_tn, total_classifications, out=np.zeros_like(global_tp, dtype=float), where=total_classifications!=0)
+    precision = np.divide(global_tp, global_tp + global_fp, out=np.zeros_like(global_tp, dtype=float), where=(global_tp+global_fp)!=0)
+    recall = np.divide(global_tp, global_tp + global_fn, out=np.zeros_like(global_tp, dtype=float), where=(global_tp+global_fn)!=0)
+    f1_scores = np.divide(2 * (precision * recall), (precision + recall), out=np.zeros_like(global_tp, dtype=float), where=(precision+recall)!=0)
 
-        # =========================================================
-        # PHASE 2: Ranking Evaluation (Leave-One-Out Top-N)
-        # =========================================================
-        seen_recipes = set(test_df['recipe_id'].values % TOTAL_RECIPES).union(set(train_df['recipe_id'].values % TOTAL_RECIPES))
-        client_hits = 0
-        client_ndcg = 0
-        
-        # --- THE FIX: Only rank items the user ACTUALLY liked ---
-        liked_test_df = test_df[test_df['rating'] >= 4]
-        
-        with torch.no_grad():
-            # Iterate over the filtered dataframe instead of the full test_df
-            for index, row in liked_test_df.iterrows():
-                true_recipe = torch.tensor([row['recipe_id'] % TOTAL_RECIPES], dtype=torch.long)
-                
-                fake_recipes_list = []
-                while len(fake_recipes_list) < NUM_NEGATIVE_SAMPLES:
-                    rand_id = np.random.randint(0, TOTAL_RECIPES)
-                    if rand_id not in seen_recipes:
-                        fake_recipes_list.append(rand_id)
-                
-                fake_recipes = torch.tensor(fake_recipes_list, dtype=torch.long)
-                all_recipes = torch.cat([true_recipe, fake_recipes])
-                
-                scores = local_model(all_recipes).squeeze().numpy()
-                ranked_indices = scores.argsort()[::-1]
-                rank_of_true_item = (ranked_indices == 0).nonzero()[0][0]
-                
-                if rank_of_true_item < TOP_N:
-                    client_hits += 1
-                    client_ndcg += 1.0 / math.log2(rank_of_true_item + 2) 
-        
-        global_hits += client_hits
-        global_ndcg += client_ndcg
-        
-        # Make sure we only add the length of the filtered dataframe to the total!
-        total_ranking_tests += len(liked_test_df) 
-        
-        print(f"[Client {client_id:02d}] Evaluated {len(test_df)} classifications and {len(liked_test_df)} rankings.")
+    print(f"--- Simulating Edge Evaluation Aggregation over {len(epochs)} Epochs ---")
+
+    for i, epoch in enumerate(epochs):
+        print(f"[Epoch {int(epoch):02d}] Acc: {accuracy[i]:.4f} | Prec: {precision[i]:.4f} | Rec: {recall[i]:.4f} | F1: {f1_scores[i]:.4f}")
 
     # =========================================================
     # FINAL MATH & REPORTING
@@ -172,35 +62,53 @@ def main():
     print("🎉 DECENTRALIZED EVALUATION COMPLETE 🎉")
     print(f"{'='*60}")
     
-    # 1. Classification Metrics
-    total_classifications = global_tp + global_tn + global_fp + global_fn
-    accuracy = (global_tp + global_tn) / total_classifications if total_classifications > 0 else 0
-    precision = global_tp / (global_tp + global_fp) if (global_tp + global_fp) > 0 else 0
-    recall = global_tp / (global_tp + global_fn) if (global_tp + global_fn) > 0 else 0
-    f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-
-    print("\n--- Phase 1: Classification Metrics (Threshold = 0.5) ---")
-    print(f"Accuracy  : {accuracy:.4f} ({accuracy*100:.2f}%)")
-    print(f"Precision : {precision:.4f}")
-    print(f"Recall    : {recall:.4f}")
-    print(f"F1-Score  : {f1:.4f}")
-    print(f"\nConfusion Matrix (Global):")
-    print(f"TN: {global_tn} | FP: {global_fp}")
-    print(f"FN: {global_fn} | TP: {global_tp}")
-
-    # 2. Ranking Metrics
-    if total_ranking_tests > 0:
-        final_hr = global_hits / total_ranking_tests
-        final_ndcg = global_ndcg / total_ranking_tests
+    if len(epochs) > 0:
+        print("\n--- Final Epoch Metrics (Threshold = 0.5) ---")
+        print(f"Accuracy  : {accuracy[-1]:.4f} ({accuracy[-1]*100:.2f}%)")
+        print(f"Precision : {precision[-1]:.4f}")
+        print(f"Recall    : {recall[-1]:.4f}")
+        print(f"F1-Score  : {f1_scores[-1]:.4f}")
         
-        print("\n--- Phase 2: Top-N Recommendation Metrics ---")
-        print(f"Total Ranking Tests : {total_ranking_tests}")
-        print(f"Global HR@{TOP_N}       : {final_hr:.4f} ({final_hr*100:.2f}%)")
-        print(f"Global NDCG@{TOP_N}     : {final_ndcg:.4f}")
+        print("\n--- Final Confusion Matrix ---")
+        print(f"                Predicted False | Predicted True")
+        print(f"Actual False  | TN: {int(global_tn[-1]):<11} | FP: {int(global_fp[-1])}")
+        print(f"Actual True   | FN: {int(global_fn[-1]):<11} | TP: {int(global_tp[-1])}")
+
+        # 2. Ranking Metrics
+        if all_ranking:
+            combined_ranking = pd.concat(all_ranking, ignore_index=True)
+            global_hits = combined_ranking['hits'].sum()
+            global_ndcg = combined_ranking['ndcg'].sum()
+            total_ranking_tests = combined_ranking['total_ranking_tests'].sum()
+            
+            if total_ranking_tests > 0:
+                final_hr = global_hits / total_ranking_tests
+                final_ndcg = global_ndcg / total_ranking_tests
+                
+                print("\n--- Final Phase 2: Top-N Recommendation Metrics ---")
+                print(f"Total Ranking Tests : {int(total_ranking_tests)}")
+                print(f"Global HR@{TOP_N}       : {final_hr:.4f} ({final_hr*100:.2f}%)")
+                print(f"Global NDCG@{TOP_N}     : {final_ndcg:.4f}")
+            
+        # Generate the plot
+        plt.figure(figsize=(10, 6))
+        plt.plot(epochs, accuracy, label='Accuracy', marker='o')
+        plt.plot(epochs, precision, label='Precision', marker='s')
+        plt.plot(epochs, recall, label='Recall', marker='^')
+        plt.title('Global Swarm Classification Metrics over Epochs')
+        plt.xlabel('Global Epoch')
+        plt.ylabel('Score (0.0 to 1.0)')
+        plt.ylim(0, 1.05)
+        plt.legend()
+        plt.grid(True)
+        
+        plot_path = os.path.join(GLOBAL_DIR, 'classification_metrics_plot.png')
+        plt.savefig(plot_path)
+        plt.close()
+        print(f"\n📈 Line graph saved to: {plot_path}")
     else:
-        print("\n--- Phase 2: Top-N Recommendation Metrics ---")
         print("No evaluation data could be processed.")
-        
+
     print(f"{'='*60}\n")
 
 if __name__ == "__main__":
