@@ -1,7 +1,7 @@
 # Global Configuration for Swarm Learning Project
 
 NUM_ACTIVE_CLIENTS = 50
-TOTAL_EPOCHS = 3
+TOTAL_EPOCHS = 50
 ROUNDS_PER_EPOCH = 1
 
 # --- Top-N Recommendation Settings ---

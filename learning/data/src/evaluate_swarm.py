@@ -7,6 +7,7 @@ from config import NUM_ACTIVE_CLIENTS, TOTAL_EPOCHS, TOP_N
 
 PODS_DIR = "../pods"
 GLOBAL_DIR = "../global"
+IMAGES_DIR = "../images"
 
 def main():
     print("📊 Aggregating Per-Epoch Classification and Final Ranking Stats...\n")
@@ -28,6 +29,7 @@ def main():
             
         if os.path.exists(ranking_path):
             rdf = pd.read_csv(ranking_path)
+            rdf['client_id'] = client_id
             all_ranking.append(rdf)
 
     if not all_metrics:
@@ -89,8 +91,35 @@ def main():
                 print(f"Total Ranking Tests : {int(total_ranking_tests)}")
                 print(f"Global HR@{TOP_N}       : {final_hr:.4f} ({final_hr*100:.2f}%)")
                 print(f"Global NDCG@{TOP_N}     : {final_ndcg:.4f}")
+                
+                # --- New Plot: Per-Client Ranking Metrics ---
+                os.makedirs(IMAGES_DIR, exist_ok=True)
+                combined_ranking['hr'] = np.where(combined_ranking['total_ranking_tests'] > 0, 
+                                                  combined_ranking['hits'] / combined_ranking['total_ranking_tests'], 0)
+                combined_ranking['ndcg_score'] = np.where(combined_ranking['total_ranking_tests'] > 0, 
+                                                          combined_ranking['ndcg'] / combined_ranking['total_ranking_tests'], 0)
+                
+                plt.figure(figsize=(14, 6))
+                bar_width = 0.35
+                x = np.arange(len(combined_ranking['client_id']))
+                
+                plt.bar(x - bar_width/2, combined_ranking['hr'], width=bar_width, label=f'HR@{TOP_N}', color='#66BB6A')
+                plt.bar(x + bar_width/2, combined_ranking['ndcg_score'], width=bar_width, label=f'NDCG@{TOP_N}', color='#FFA726')
+                
+                plt.title(f'Final Top-{TOP_N} Recommendation Metrics per Client')
+                plt.xlabel('Client ID')
+                plt.ylabel('Score')
+                plt.xticks(x, combined_ranking['client_id'], rotation=90 if len(x) > 20 else 0)
+                plt.ylim(0, 1.05)
+                plt.legend()
+                plt.grid(axis='y', alpha=0.3)
+                plt.tight_layout()
+                plt.savefig(os.path.join(IMAGES_DIR, 'per_client_ranking_metrics.png'))
+                plt.close()
             
-        # Generate the plot
+        # Generate the classification plots
+        os.makedirs(IMAGES_DIR, exist_ok=True)
+        
         plt.figure(figsize=(10, 6))
         plt.plot(epochs, accuracy, label='Accuracy', marker='o')
         plt.plot(epochs, precision, label='Precision', marker='s')
@@ -101,11 +130,89 @@ def main():
         plt.ylim(0, 1.05)
         plt.legend()
         plt.grid(True)
-        
-        plot_path = os.path.join(GLOBAL_DIR, 'classification_metrics_plot.png')
-        plt.savefig(plot_path)
+        plt.savefig(os.path.join(IMAGES_DIR, 'classification_metrics_plot.png'))
         plt.close()
-        print(f"\n📈 Line graph saved to: {plot_path}")
+        
+        # --- New Plot: Stacked Area CM Components ---
+        plt.figure(figsize=(10, 6))
+        plt.stackplot(epochs, global_tp, global_tn, global_fp, global_fn, labels=['TP', 'TN', 'FP', 'FN'], colors=['#4CAF50', '#66BB6A', '#F44336', '#EF5350'], alpha=0.8)
+        plt.title('Global Confusion Matrix Distribution over Epochs')
+        plt.xlabel('Global Epoch')
+        plt.ylabel('Total Classifications')
+        plt.legend(loc='upper left')
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(os.path.join(IMAGES_DIR, 'global_cm_stacked_area.png'))
+        plt.close()
+        
+        # --- New Plot: Per-Client Final Epoch Accuracy ---
+        final_epoch = epochs[-1]
+        final_client_metrics = combined_df[combined_df['epoch'] == final_epoch].copy()
+        if not final_client_metrics.empty:
+            final_client_metrics['total'] = final_client_metrics['tp'] + final_client_metrics['tn'] + final_client_metrics['fp'] + final_client_metrics['fn']
+            final_client_metrics['accuracy'] = np.where(final_client_metrics['total'] > 0, 
+                                                        (final_client_metrics['tp'] + final_client_metrics['tn']) / final_client_metrics['total'], 0)
+            
+            plt.figure(figsize=(14, 6))
+            plt.bar(final_client_metrics['client_id'], final_client_metrics['accuracy'], color='#29B6F6', edgecolor='black')
+            plt.axhline(y=accuracy[-1], color='#D32F2F', linestyle='--', linewidth=2, label=f'Global Avg ({accuracy[-1]:.4f})')
+            plt.title(f'Final Epoch ({int(final_epoch)}) Accuracy per Client')
+            plt.xlabel('Client ID')
+            plt.ylabel('Accuracy')
+            plt.xticks(final_client_metrics['client_id'], rotation=90 if len(final_client_metrics['client_id']) > 20 else 0)
+            plt.ylim(0, 1.05)
+            plt.legend()
+            plt.grid(axis='y', alpha=0.7)
+            plt.tight_layout()
+            plt.savefig(os.path.join(IMAGES_DIR, 'per_client_final_accuracy.png'))
+            plt.close()
+            
+            # --- New Plot: Client Accuracy Trajectories (Spaghetti Plot) ---
+            plt.figure(figsize=(12, 7))
+            for c_id in combined_df['client_id'].unique():
+                client_data = combined_df[combined_df['client_id'] == c_id].copy()
+                client_data = client_data.sort_values('epoch')
+                c_total = client_data['tp'] + client_data['tn'] + client_data['fp'] + client_data['fn']
+                c_acc = np.where(c_total > 0, (client_data['tp'] + client_data['tn']) / c_total, 0)
+                plt.plot(client_data['epoch'], c_acc, alpha=0.3, color='gray')
+                
+            plt.plot(epochs, accuracy, color='#D32F2F', linewidth=3, label='Global Average')
+            plt.title('Client Accuracy Trajectories over Epochs')
+            plt.xlabel('Global Epoch')
+            plt.ylabel('Accuracy')
+            plt.ylim(0, 1.05)
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(os.path.join(IMAGES_DIR, 'client_accuracy_trajectories.png'))
+            plt.close()
+
+            # --- New Plot: Distribution of Final Client Accuracies ---
+            plt.figure(figsize=(8, 6))
+            plt.hist(final_client_metrics['accuracy'], bins=np.linspace(0, 1, 21), color='#AB47BC', edgecolor='black', alpha=0.7)
+            plt.axvline(x=accuracy[-1], color='#D32F2F', linestyle='--', linewidth=2, label=f'Global Avg ({accuracy[-1]:.4f})')
+            plt.title('Distribution of Final Client Accuracies')
+            plt.xlabel('Accuracy')
+            plt.ylabel('Number of Clients')
+            plt.legend()
+            plt.grid(axis='y', alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(os.path.join(IMAGES_DIR, 'final_accuracy_distribution.png'))
+            plt.close()
+
+            # --- New Plot: Evaluation Data Volume per Client ---
+            plt.figure(figsize=(14, 6))
+            plt.bar(final_client_metrics['client_id'], final_client_metrics['total'], color='#8D6E63', edgecolor='black')
+            plt.title('Total Evaluation Samples per Client (Data Diversity/Imbalance)')
+            plt.xlabel('Client ID')
+            plt.ylabel('Number of Samples')
+            plt.xticks(final_client_metrics['client_id'], rotation=90 if len(final_client_metrics['client_id']) > 20 else 0)
+            plt.grid(axis='y', alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(os.path.join(IMAGES_DIR, 'per_client_data_volume.png'))
+            plt.close()
+            
+        print(f"\n📈 Visualizations successfully saved to the '{IMAGES_DIR}' directory.")
     else:
         print("No evaluation data could be processed.")
 

@@ -49,7 +49,7 @@ class HighwayLayer(nn.Module):
         return h * t + x * c
 
 class DecentralizedFoodRecommender(nn.Module):
-    def __init__(self, num_recipes=TOTAL_RECIPES, embedding_dim=128, num_highway_layers=3):
+    def __init__(self, num_recipes=TOTAL_RECIPES, embedding_dim=64, num_highway_layers=3):
         super(DecentralizedFoodRecommender, self).__init__()
         
         # 1. Higher Capacity Embeddings
@@ -148,7 +148,7 @@ class SwarmNode:
         # ML setup
         self.model = DecentralizedFoodRecommender()
         self.optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=1e-5) #add weight decal to prevent overfitting
-        self.criterion = FocalLoss(alpha=0.25, gamma=2.0)
+        self.criterion = FocalLoss(alpha=0.05, gamma=2.0)
 
     def sync_data_from_solid(self):
         """Authenticates with the Solid Pod and downloads the latest training data."""
@@ -222,7 +222,8 @@ class SwarmNode:
         
         # 6. Generate Strict Negative Samples
         num_interactions = len(train_df)
-        num_negatives = max(1, int(num_interactions * 2.0))
+        #num_negatives = max(1, int(num_interactions * 2.0))
+        num_negatives = 0
         neg_recipes_list = []
         
         while len(neg_recipes_list) < num_negatives:
