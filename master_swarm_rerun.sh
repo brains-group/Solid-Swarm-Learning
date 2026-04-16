@@ -1,5 +1,7 @@
 #!/bin/bash
-
+# Force the system to allow a larger backlog of connections
+ulimit -n 10000
+ulimit -u 10000
 
 
 # --- CONFIGURATION ---
@@ -18,10 +20,14 @@ if [ -z "$TMUX" ]; then
         exec tmux attach -t "$SESSION_NAME"
     else
         echo "🚀 No active session found. Launching new Tmux orchestrator..."
-        # Create or reset the log and run THIS script inside the session
-        echo "--- New Execution Started: $(date) ---" > "$LOG_FILE"
+
+        echo "--- New Execution Started: $(date) ---" > "$LOG_FILE" # delete old log
+        sleep 1
+        # Create the session and run THIS script inside it
         tmux new-session -d -s "$SESSION_NAME" "bash \"$0\"; bash"
         exec tmux attach -t "$SESSION_NAME"
+
+        
     fi
 fi
 
@@ -34,13 +40,6 @@ fi
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "🚀 Initiating the True Master Swarm Orchestrator..."
-
-# Ensure we only remove global .pt models (leave other data alone)
-GLOBAL_DATA_DIR="learning/data/global"
-if [ -d "$GLOBAL_DATA_DIR" ]; then
-    echo "🧹 Cleaning any existing global .pt models..."
-    find "$GLOBAL_DATA_DIR" -maxdepth 1 -type f -name "*.pt" -exec rm -f {} + 2>/dev/null || true
-fi
 
 # Extract Number of Clients from Python config
 CONFIG_FILE="learning/data/src/config.py"
@@ -82,16 +81,15 @@ sleep 2
 
 # --- PHASE 1: INFRASTRUCTURE ---
 
-echo "▶️ [1/9] Booting Solid Server..."
+echo "▶️ [1/7] Booting Solid Server..."
 cd solid_backend
-rm -rf my-solid-data .internal
 npm run build > /dev/null 2>&1
 nvm exec 20 node --require cross-fetch/polyfill dist/SolidApplication.js > ../solid.log 2>&1 &
 cd ..
 
-echo "▶️ [2/9] Booting Anvil Blockchain..."
+echo "▶️ [2/7] Booting Anvil Blockchain..."
 cd swarm_orchestrator
-anvil > ../anvil.log 2>&1 &
+anvil --block-time 0.5 > ../anvil.log 2>&1 &
 cd ..
 
 # HEARTBEAT CHECK
@@ -107,16 +105,12 @@ while ! curl -s http://localhost:3000 > /dev/null; do
         exit 1
     fi
 done
+
 echo -e "\n✅ Solid Server is UP!"
 
 # --- PHASE 2: SETUP ---
 
-echo "▶️ [3/9] Generating Solid Accounts..."
-cd solid_backend/scripts
-node --require cross-fetch/polyfill --dns-result-order=ipv4first create_accounts.js
-cd ../..
-
-echo "▶️ [4/9] Deploying Smart Contracts..."
+echo "▶️ [3/7] Deploying Smart Contracts..."
 cd swarm_orchestrator
 forge script script/Deploy_SC.sol --rpc-url http://127.0.0.1:8545 --broadcast
 cd ..
@@ -125,24 +119,23 @@ cd ..
 
 cd learning/data/src
 
-echo "▶️ [5/9] Partitioning Data..."
-python3 partition_data.py
-echo "▶️ [6/9] Registering Clients..."
+echo "▶️ [4/7] Registering Clients..."
 python3 register_clients.py
 
-echo "▶️ [7/9] Configuring Swarm Privacy, DP & Vulnerability Toggles..."
+echo "▶️ [5/7] Configuring Swarm Privacy, DP & Vulnerability Toggles..."
 # Initializing 50 nodes with a baseline Epsilon of 10.0
 # This registers the privacy state on the blockchain for each Pod
 for i in $(seq 1 "$NUM_CLIENTS"); do
     python3 toggle_dp.py "$i" 10.0 > /dev/null 2>&1
+    echo "✅ DP & Vulnerability values set for Pod $i"
     # Optional: toggle_vulnerability.py "$i" 0 (if you have a toggle script for vulnerability)
 done
-echo "✅ Privacy baseline set for $NUM_CLIENTS nodes (Epsilon: 10.0)."
+echo "✅✅ Privacy baseline set for $NUM_CLIENTS nodes (Epsilon: 10.0)."
 
-echo "▶️ [8/9] Launching Swarm Training Loop..."
+echo "▶️ [6/7] Launching Swarm Training Loop..."
 python3 run_swarm.py
 
-echo "▶️ [9/9] Training Complete! Evaluating Swarm Network..."
+echo "▶️ [7/7] Training Complete! Evaluating Swarm Network..."
 python3 evaluate_swarm.py
 
 echo ""

@@ -1,6 +1,6 @@
-# Food Swarm - Decentralized Recommender System
+# General Swarm - Decentralized Recommender System
 
-This project implements a decentralized machine learning system for building a food recommendation model using Swarm Learning. The system is orchestrated by a Solidity smart contract on an Ethereum-like blockchain (Anvil) and executed by a network of Python-based client nodes to store the data via a network of Solid Pods.
+This project implements a decentralized machine learning system for building a general recommendation model using Swarm Learning. In this demo we showcase it via both a food and movie dataset. The system is orchestrated by a Solidity smart contract on an Ethereum-like blockchain (Anvil) and executed by a network of Python-based client nodes to store the data via a network of Solid Pods.
 
 ## Project Structure
 
@@ -42,19 +42,6 @@ food_swarm_project/
 ├── secret/         # holds each client authentication details
 ```
 
-
-# Decentralized Swarm Learning with Solid Pod Architecture
-
-This project implements a privacy-preserving, decentralized Swarm Learning network for a Top-N Food Recommendation System. It bridges the incentive and coordination structures of blockchain technology with the strict data sovereignty principles of the Solid ecosystem.
-
-## The Core Idea
-
-In a traditional machine learning paradigm, user data is aggregated into a centralized server to train a recommendation model. This creates massive data silos and strips users of their privacy. 
-
-While standard Federated Learning attempts to solve this by keeping data on the edge and only sharing model weights, it still suffers from multiple problems like the single point of failure, Model Inversion Attacks, and model poisoning.
-
-This project introduces a completely decoupled architecture. It uses Solid Pods to store local edge nodes in decentralized, secure, user-controlled data vault.
-
 ## The Process
 
 The lifecycle of this decentralized network operates in distinct phases:
@@ -71,125 +58,60 @@ Once the Smart Contract detects that an 80% consensus threshold has been reached
 ### 5. Edge Evaluation
 Because evaluation cannot happen centrally without compromising privacy, evaluation (for now) is performed entirely on the edge. Each Pod wakes up, loads the latest global model and its private state, and calculates its own ranking metrics.
 
-## Local Setup
+## Minimal requirements (what to install) to run this project:
 
-Before running the full simulation, you need to install the dependencies for both the Python clients and the Node.js Solid server.
+- Python 3.10+ with these Python packages (see `learning/requirements.txt`):
+    - numpy, pandas, torch, scikit-learn, matplotlib
+- Node.js and npm (for the Solid server in `solid_backend`)
+- Foundry tooling (Forge / Anvil) for local EVM testing
+- tmux (optional, used by master scripts)
+- the ml-32m dataset created by MovieLens (https://grouplens.org/datasets/movielens/), saved within learning/data/global in its own folder called ml-32m
 
-### 1. Python Dependencies
-Navigate to the `learning/data/src` directory and install the required packages from `requirements.txt`.
-
-### 2. Node.js Dependencies
-From the project's root directory (`c:\Work\Swarm`), install the Node.js packages. This is required to run the Solid Pod server simulation.
-
-npm install
-
-### 3. Forge Dependencies
-This project works by creating a local blockchain with fake ETH through Forge. This is requirered to set up the Swarm structure.
-
-forge init swarm_orchestrator
-cd swarm_orchestrator
-
-Furthermore, the given SwarmCoordinator.sol smart contract must be moved within swarm_orchestrator/src/ to interact with the blockchain 
+See the `learning/requirements.txt` for the full Python dependency list. The repository contains orchestration scripts under the project root and Python code under `learning/data/src/`.
 
 ---
 
 ## Quick Start & Execution
 
-To simulate the complete decentralized network locally, you will need to open five separate terminal windows to orchestrate the different components of the stack.
+To Edit Client/Round Values, please open config.py within learning/data/src/
 
-# Option 1
+### `master_swarm.sh`
 
-simply run ./master_swarm.sh in one terminal
+This is the main script to start a new swarm learning experiment from scratch.
 
-To view progress, run monitor_swarm.py as described below in a second terminal
+**Functionality:**
+-   Starts a local Anvil blockchain instance.
+-   Deploys the orchestrator smart contract.
+-   Sets up and starts the Solid servers for the client nodes.
+-   Starts the Python client nodes, which will then begin the decentralized training process.
 
-# Option 2
-
-### Terminal 1: Boot Solid
-
-cd solid_backend
-rm -rf my-solid-data .internal
-npm start
-
-
-be sure to remove stuff in my-solid-data so that old profiles don't mess with client generation in the future
-
-### Terminal 2: Generate Solid Clients and Pods
-
-generate the specified number of solid clients through the js script:
-
-cd solid_backend/scripts
-
-node create_accounts.js
-
-results are saved within user_accounts.json within secret, which stores log-in info
-
-### Terminal 3: Boot the Blockchain
-Start the local Ethereum testnet. This will spin up your local ledger and generate test wallets.
-
-anvil
-
-### Terminal 4: Deploy the Coordinator Contract
-
-Deploy the Smart Contract that will orchestrate the swarm leader elections and epoch transitions.
-
-cd swarm_orchestrator
-forge script script/Deploy_SC.sol --rpc-url http://127.0.0.1:8545 --broadcast
-
-### Terminal 5: Launch the Swarm Monitor
-
-Start the live dashboard to monitor node registrations, epoch progress, and leader elections in real-time.
-
-cd learning/data/src
-python3 monitor_swarm.py
-
-### Terminal 6: The Edge Nodes (Partition, Train, Evaluate)
-
-This terminal simulates the actions of the edge nodes (the clients/Pods). Run these commands in sequence:
-
-1. Partition the Data (First run only): Splits the global dataset into isolated client pods based on taste profiles.
-
-cd learning/data/src
-python3 partition_data.py
-
-2. Register the Clients: Generates local wallets for each pod and registers them to the Swarm via the smart contract.
-
-python3 register_clients.py
-
-3. Run the Swarm: Kicks off the asynchronous federated training loop. Nodes will train locally, submit public weights, and wait for the leader to aggregate the global model.
-
-python3 run_swarm.py
-
-4. Evaluate the Network: Triggers the edge nodes to evaluate their personalized models using their private Solid Pod data, reporting final metrics.
-
-python3 evaluate_swarm.py
-
-
-
-Evaluation Metrics:
-
-The network reports two primary categories of metrics to prove its efficacy:
-
-    Classification: Accuracy, Precision, Recall, and F1-Score (Threshold = 0.5) to test general positive/negative prediction capabilities.
-
-    Recommendation (Ranking): Hit Ratio (HR@10) and Normalized Discounted Cumulative Gain (NDCG@10) using a Leave-One-Out methodology mixed with 99 un-interacted negative samples.
-
-### Terminal 7: Edit Edge privacy
-
-This terminal is where you can control each pod's vulnerability and DP status via the toggle scripts, telling the blockchain whether to include or exclude a user's vulnerable data/altering the amount of differential privacy involved for that node. This code can also be run during the swarming process as well
-
-cd learning/data/src
-python3 toggle_privacy.py pod_number include/exclude
-python3 toggle_dp.py pod_number dp_value
-
----
+**How to run:**
+```bash
+./master_swarm.sh
+```
 
 
 
 
+### `master_swarm_rerun.sh`
 
+This script is used to rerun an experiment, assuming nothing has been changed in config.py, to skip the long data pertitioning steps
 
-TODO: 
-1) First make a swarm learning Agent/Class that represents a client, with logic to run local learning
-    figure out how to send & receive messages for both leader election and embeddings
-2) Maybe: use asincio so that the 50+ processes aren't computing for resources in the simulation
+**How to run:**
+```bash
+./master_swarm_rerun.sh
+```
+
+### `master_swarm_fix.sh`
+
+This script helps start back up any previous run that crashed mid-training.
+
+**How to run:**
+```bash
+./master_swarm_fix.sh
+```
+
+### Other Scripts
+
+-   `python3 learning/data/src monitor_swarm.py' can be used to keep track of current training progress
+-   `python3 learning/data/src evaluate_swarm.py' can be used to observe current epoch learning direction, as well as rerun final metrics

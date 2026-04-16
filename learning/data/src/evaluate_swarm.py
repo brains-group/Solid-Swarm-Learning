@@ -52,6 +52,10 @@ def main():
     recall = np.divide(global_tp, global_tp + global_fn, out=np.zeros_like(global_tp, dtype=float), where=(global_tp+global_fn)!=0)
     f1_scores = np.divide(2 * (precision * recall), (precision + recall), out=np.zeros_like(global_tp, dtype=float), where=(precision+recall)!=0)
 
+    # --- Derived ROC Values ---
+    tpr = recall # True Positive Rate is mathematically identical to Recall
+    fpr = np.divide(global_fp, global_fp + global_tn, out=np.zeros_like(global_fp, dtype=float), where=(global_fp+global_tn)!=0)
+
     print(f"--- Simulating Edge Evaluation Aggregation over {len(epochs)} Epochs ---")
 
     for i, epoch in enumerate(epochs):
@@ -135,7 +139,7 @@ def main():
         
         # --- New Plot: Stacked Area CM Components ---
         plt.figure(figsize=(10, 6))
-        plt.stackplot(epochs, global_tp, global_tn, global_fp, global_fn, labels=['TP', 'TN', 'FP', 'FN'], colors=['#4CAF50', '#66BB6A', '#F44336', '#EF5350'], alpha=0.8)
+        plt.stackplot(epochs, global_tp, global_tn, global_fp, global_fn, labels=['TP', 'TN', 'FP', 'FN'], colors=['#4CAF50', '#83BB6A', '#F44336', '#225350'], alpha=0.8)
         plt.title('Global Confusion Matrix Distribution over Epochs')
         plt.xlabel('Global Epoch')
         plt.ylabel('Total Classifications')
@@ -211,6 +215,30 @@ def main():
             plt.tight_layout()
             plt.savefig(os.path.join(IMAGES_DIR, 'per_client_data_volume.png'))
             plt.close()
+
+
+            # --- NEW PLOT: GLOBAL ROC TRAJECTORY ---
+        plt.figure(figsize=(8, 8))
+        # Plot the trajectory line through ROC space
+        plt.plot(fpr, tpr, color='#FF8C00', lw=2, marker='o', markersize=6, label='Global Swarm Trajectory')
+        
+        # Annotate specific epochs along the line to show progress direction
+        for i, epoch_num in enumerate(epochs):
+            if i == 0 or i == len(epochs)-1 or i % max(1, len(epochs)//5) == 0:
+                plt.annotate(f"E{int(epoch_num)}", (fpr[i], tpr[i]), textcoords="offset points", xytext=(8,-5), ha='left', fontsize=10, fontweight='bold')
+
+        plt.plot([0, 1], [0, 1], color='#2F4F4F', lw=2, linestyle='--') # Random guess diagonal
+        plt.xlabel('False Positive Rate (1 - Specificity)', fontsize=12)
+        plt.ylabel('True Positive Rate (Recall)', fontsize=12)
+        plt.title(f'Global Swarm ROC Trajectory\n(Movement of the global decision boundary across {TOTAL_EPOCHS} epochs)', fontsize=14)
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.legend(loc="lower right", fontsize=11)
+        plt.grid(alpha=0.3)
+        
+        roc_traj_path = os.path.join(IMAGES_DIR, 'global_roc_trajectory.png')
+        plt.savefig(roc_traj_path)
+        plt.close()
             
         print(f"\n📈 Visualizations successfully saved to the '{IMAGES_DIR}' directory.")
     else:

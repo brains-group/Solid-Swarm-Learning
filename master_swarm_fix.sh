@@ -1,7 +1,5 @@
 #!/bin/bash
 
-
-
 # --- CONFIGURATION ---
 SESSION_NAME="swarm_orchestrator"
 LOG_FILE="master_swarm.log"
@@ -18,8 +16,9 @@ if [ -z "$TMUX" ]; then
         exec tmux attach -t "$SESSION_NAME"
     else
         echo "🚀 No active session found. Launching new Tmux orchestrator..."
-        # Create or reset the log and run THIS script inside the session
-        echo "--- New Execution Started: $(date) ---" > "$LOG_FILE"
+        echo "--- New Execution Started: $(date) ---" > "$LOG_FILE" # delete old log
+        sleep 1
+        # Create the session and run THIS script inside it
         tmux new-session -d -s "$SESSION_NAME" "bash \"$0\"; bash"
         exec tmux attach -t "$SESSION_NAME"
     fi
@@ -30,27 +29,73 @@ fi
 # ---------------------------------------------------------------------------
 
 # --- LOGGING SETUP ---
-
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-echo "🚀 Initiating the True Master Swarm Orchestrator..."
+echo "🚀 Initiating the Master Swarm Orchestrator (with Auto-Reload)..."
 
-# Ensure we only remove global .pt models (leave other data alone)
-GLOBAL_DATA_DIR="learning/data/global"
-if [ -d "$GLOBAL_DATA_DIR" ]; then
-    echo "🧹 Cleaning any existing global .pt models..."
-    find "$GLOBAL_DATA_DIR" -maxdepth 1 -type f -name "*.pt" -exec rm -f {} + 2>/dev/null || true
-fi
-
-# Extract Number of Clients from Python config
+# Extract Configuration from Python config
 CONFIG_FILE="learning/data/src/config.py"
 if [ -f "$CONFIG_FILE" ]; then
     # Uses grep/sed to find the line and extract the number
     NUM_CLIENTS=$(grep "NUM_ACTIVE_CLIENTS =" "$CONFIG_FILE" | sed 's/[^0-9]*//g')
-    echo "📊 Configured for $NUM_CLIENTS active clients."
+    TOTAL_EPOCHS=$(grep "TOTAL_EPOCHS =" "$CONFIG_FILE" | sed 's/[^0-9]*//g')
+    echo "📊 Configured for $NUM_CLIENTS active clients and $TOTAL_EPOCHS total epochs."
 else
-    echo "⚠️ Warning: config.py not found. Defaulting to 50 clients."
+    echo "⚠️ Warning: config.py not found. Defaulting to 50 clients and 25 epochs."
     NUM_CLIENTS=50
+    TOTAL_EPOCHS=25
+fi
+
+GLOBAL_DATA_DIR="learning/data/global"
+
+# Determine latest epoch using Python to robustly pull digits out of filenames
+LATEST_EPOCH=$(python3 - <<'PY'
+import os, re
+d = r'$GLOBAL_DATA_DIR'
+m = 0
+if os.path.exists(d):
+    for f in os.listdir(d):
+        fp = os.path.join(d, f)
+        # Only inspect regular files that look like global model weights (avoid logs/images/other files)
+        if not os.path.isfile(fp):
+            continue
+        lf = f.lower()
+        if not lf.endswith('.pt'):
+            continue
+        if 'global_model' not in lf and 'global' not in lf:
+            continue
+        # Prefer explicit _e<NUM>.pt pattern
+        m1 = re.search(r'_e(\d+)\.pt$', lf)
+        if m1:
+            m = max(m, int(m1.group(1)))
+            continue
+        # Fallback: try to find any trailing number groups
+        nums = re.findall(r'\d+', lf)
+        if nums:
+            m = max(m, max(map(int, nums)))
+print(m)
+PY
+ 2>/dev/null || echo 0)
+
+if [ -z "$LATEST_EPOCH" ]; then
+    LATEST_EPOCH=0
+fi
+
+# --- RESUME / RESTART LOGIC ---
+RESUME_MODE=false
+if [ "$LATEST_EPOCH" -gt 0 ]; then
+    if [ "$LATEST_EPOCH" -ge "$TOTAL_EPOCHS" ]; then
+        echo "✅ Final model weights for epoch $LATEST_EPOCH detected (Total expected: $TOTAL_EPOCHS)."
+        echo "🔄 Restarting training from scratch..."
+        RESUME_MODE=false
+    else
+        echo "⚠️ Crash detected! Found model weights up to epoch $LATEST_EPOCH."
+        echo "🚀 Resuming training from where it left off..."
+        RESUME_MODE=true
+    fi
+else
+    echo "ℹ️ No existing model weights found. Starting fresh..."
+    RESUME_MODE=false
 fi
 
 # 1. SETUP ENVIRONMENT
@@ -73,18 +118,28 @@ else
 fi
 
 # Cleanup and Trap
-# Note: In Tmux, killing the foreground process won't necessarily close the window
 trap 'echo -e "\n🛑 Shutting down background servers..."; kill $(jobs -p) 2>/dev/null; exit' EXIT
 
 echo "🧹 Clearing ghost processes..."
 lsof -ti:3000,3001,8545 | xargs kill -9 2>/dev/null || true
 sleep 2
 
+# Clean previous run state if restarting from scratch
+if [ "$RESUME_MODE" = false ] && [ -d "$GLOBAL_DATA_DIR" ]; then
+    echo "🧹 Wiping old global .pt models to ensure a clean start..."
+    find "$GLOBAL_DATA_DIR" -maxdepth 1 -type f -name "*.pt" -exec rm -f {} + 2>/dev/null
+fi
+
 # --- PHASE 1: INFRASTRUCTURE ---
 
 echo "▶️ [1/9] Booting Solid Server..."
 cd solid_backend
-rm -rf my-solid-data .internal
+if [ "$RESUME_MODE" = false ]; then
+    echo "🧹 Removing old Solid pod data..."
+    rm -rf my-solid-data .internal
+else
+    echo "♻️ Preserving Solid pod data for resume..."
+fi
 npm run build > /dev/null 2>&1
 nvm exec 20 node --require cross-fetch/polyfill dist/SolidApplication.js > ../solid.log 2>&1 &
 cd ..
@@ -111,10 +166,14 @@ echo -e "\n✅ Solid Server is UP!"
 
 # --- PHASE 2: SETUP ---
 
-echo "▶️ [3/9] Generating Solid Accounts..."
-cd solid_backend/scripts
-node --require cross-fetch/polyfill --dns-result-order=ipv4first create_accounts.js
-cd ../..
+if [ "$RESUME_MODE" = false ]; then
+    echo "▶️ [3/9] Generating Solid Accounts..."
+    cd solid_backend/scripts
+    node --require cross-fetch/polyfill --dns-result-order=ipv4first create_accounts.js
+    cd ../..
+else
+    echo "▶️ [3/9] ♻️ Skipping Solid Account Generation (Resume Mode)..."
+fi
 
 echo "▶️ [4/9] Deploying Smart Contracts..."
 cd swarm_orchestrator
@@ -125,21 +184,35 @@ cd ..
 
 cd learning/data/src
 
-echo "▶️ [5/9] Partitioning Data..."
-python3 partition_data.py
+if [ "$RESUME_MODE" = false ]; then
+    echo "▶️ [5/9] Partitioning Data..."
+    python3 partition_data.py
+else
+    echo "▶️ [5/9] ♻️ Skipping Data Partitioning (Resume Mode)..."
+fi
+
 echo "▶️ [6/9] Registering Clients..."
 python3 register_clients.py
 
 echo "▶️ [7/9] Configuring Swarm Privacy, DP & Vulnerability Toggles..."
-# Initializing 50 nodes with a baseline Epsilon of 10.0
-# This registers the privacy state on the blockchain for each Pod
+# Initializing nodes with a baseline Epsilon of 10.0
 for i in $(seq 1 "$NUM_CLIENTS"); do
     python3 toggle_dp.py "$i" 10.0 > /dev/null 2>&1
-    # Optional: toggle_vulnerability.py "$i" 0 (if you have a toggle script for vulnerability)
+    echo "✅ DP & Vulnerability values set for Pod $i"
 done
 echo "✅ Privacy baseline set for $NUM_CLIENTS nodes (Epsilon: 10.0)."
 
 echo "▶️ [8/9] Launching Swarm Training Loop..."
+# Export START_EPOCH so training processes can pick up where they left off
+if [ "$RESUME_MODE" = true ]; then
+    # Resume from the next epoch after the latest completed one
+    NEXT_EPOCH=$((LATEST_EPOCH + 1))
+    export START_EPOCH="$NEXT_EPOCH"
+    echo "🔁 Resuming from epoch $START_EPOCH (latest complete was $LATEST_EPOCH)"
+else
+    export START_EPOCH=0
+fi
+
 python3 run_swarm.py
 
 echo "▶️ [9/9] Training Complete! Evaluating Swarm Network..."

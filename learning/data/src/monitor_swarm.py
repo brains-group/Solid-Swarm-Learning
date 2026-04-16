@@ -50,7 +50,7 @@ def main():
 
             leader_str = f"{leader[:8]}..." if leader != "0x0000000000000000000000000000000000000000" else "None      "
 
-            print(f"Global Swarm | Epoch: {current_epoch} / {TOTAL_EPOCHS} | Submitted: {nodes_submitted}/{total_expected} | Leader: {leader_str} | Status: {status}")
+            print(f"Global Swarm | Epoch: {current_epoch} / {TOTAL_EPOCHS} | Submitted: {nodes_submitted}/{total_expected} | Leader: {leader_str}")
 
             print("\n==========================================================================")
             print("Press Ctrl+C to exit")

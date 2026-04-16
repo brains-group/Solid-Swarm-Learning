@@ -1,6 +1,8 @@
 import os
 import json
+from pathlib import Path
 import time
+import random
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -13,7 +15,8 @@ from config import TOTAL_EPOCHS, TOTAL_RECIPES, ROUNDS_PER_EPOCH, TOP_N, NUM_NEG
 import numpy as np
 import torch.nn.functional as F
 import math
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve
+import matplotlib.pyplot as plt
 
 # Absolute import to avoid relative import errors
 from config import TOTAL_EPOCHS
@@ -93,8 +96,8 @@ class DecentralizedFoodRecommender(nn.Module):
         mlp_score = self.output(x).squeeze()
         
         # THE FIX: Final Score = Interaction (MLP) + Similarity (Dot) + Popularity (Bias)
-        # We wrap it in sigmoid to get the 0-1 probability
-        return torch.sigmoid(mlp_score + dot_product + b)
+        # Return raw logits; apply sigmoid at inference/time of thresholding.
+        return mlp_score + dot_product + b
 
 class FocalLoss(nn.Module):
     def __init__(self, alpha=0.2, gamma=2.0):
@@ -123,19 +126,58 @@ class SwarmNode:
     def __init__(self, client_id):
         self.client_id = client_id
         self.pod_dir = os.path.join(PODS_DIR, f"client_{client_id}")
+        print(f"[Client {self.client_id}] Initializing client (pid={os.getpid()})...")
         
-        # Load profile and credentials
-        with open(os.path.join(self.pod_dir, 'profile.json'), 'r') as f:
-            self.profile = json.load(f)
-            self.swarm_ids = self.profile['swarm_ids']
-            self.wallet_address = self.profile['wallet_address']
-            self.private_key = self.profile['private_key']
-            
-            # Extract Solid Credentials
-            self.solid_url = self.profile.get('solid_pod_url', 'http://localhost:3000')
-            self.solid_username = self.profile.get('solid_username', '')
-            self.solid_token_id = self.profile.get('solid_token_id', '')
-            self.solid_token_secret = self.profile.get('solid_token_secret', '')
+        # Load profile and credentials. Prefer local profile.json for backward
+        # compatibility, but fall back to secret/user_accounts.json which is the
+        # canonical source produced by `create_accounts.js` (Solid pods).
+        self.profile = {}
+        profile_path = os.path.join(self.pod_dir, 'profile.json')
+        if os.path.exists(profile_path):
+            try:
+                with open(profile_path, 'r') as f:
+                    self.profile = json.load(f)
+            except Exception:
+                print(f"⚠️ [Client {self.client_id}] Failed to read local profile.json, falling back to secret/user_accounts.json")
+
+        # If some fields are missing, attempt to load Solid credentials from secret/user_accounts.json
+        if not self.profile or 'webid' not in self.profile:
+            # Resolve repository root and accounts path
+            repo_root = Path(__file__).resolve().parents[3]
+            accounts_path = repo_root / 'secret' / 'user_accounts.json'
+            if accounts_path.exists():
+                try:
+                    with open(accounts_path, 'r') as f:
+                        accounts = json.load(f)
+                    username = f"user{client_id}"
+                    acct = accounts.get(username, {})
+                    # Map fields from create_accounts.js structure
+                    self.profile.update({
+                        'webid': acct.get('webid', ''),
+                        'pod': acct.get('pod', ''),
+                        'email': acct.get('email', ''),
+                        'client_credentials_token_identifier': acct.get('client_credentials_token_identifier', ''),
+                        'client_credentials_token_secret': acct.get('client_credentials_token_secret', ''),
+                    })
+                except Exception as e:
+                    print(f"⚠️ [Client {self.client_id}] Could not read user_accounts.json: {e}")
+
+        # Swarm-related fields (may be absent for pods-only setup)
+        self.swarm_ids = self.profile.get('swarm_ids', [])
+        self.wallet_address = self.profile.get('wallet_address', '')
+        self.private_key = self.profile.get('private_key', '')
+
+        # Extract Solid Credentials (canonical names)
+        self.solid_url = self.profile.get('pod', self.profile.get('solid_pod_url', 'http://localhost:3000'))
+        # create_accounts uses webid/email as username; fall back cleanly
+        self.solid_username = self.profile.get('email', self.profile.get('webid', ''))
+        self.solid_token_id = self.profile.get('client_credentials_token_identifier', self.profile.get('solid_token_id', ''))
+        self.solid_token_secret = self.profile.get('client_credentials_token_secret', self.profile.get('solid_token_secret', ''))
+
+        # Warn if blockchain credentials are missing; training can proceed but
+        # submission/signing will be skipped or fail later unless provided.
+        if not self.wallet_address or not self.private_key:
+            print(f"⚠️ [Client {self.client_id}] Wallet credentials missing. On-chain submission may fail for this client.")
 
         # Blockchain setup
         self.w3 = Web3(Web3.HTTPProvider(ANVIL_RPC_URL))
@@ -147,11 +189,26 @@ class SwarmNode:
 
         # ML setup
         self.model = DecentralizedFoodRecommender()
-        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001, weight_decay=1e-5) #add weight decal to prevent overfitting
+        # Reduce LR for stability
+        self.optimizer = optim.Adam(self.model.parameters(), lr=5e-4, weight_decay=1e-5)
         self.criterion = FocalLoss(alpha=0.05, gamma=2.0)
+
+        # Signal that initialization finished (helps diagnose hangs during model construction)
+        try:
+            print(f"[Client {self.client_id}] Initialized model and environment (pid={os.getpid()}).")
+        except Exception:
+            pass
+
+        # Immediately attempt to sync training data from the user's Solid Pod.
+        try:
+            self.sync_data_from_solid()
+        except Exception as e:
+            print(f"⚠️ [Client {self.client_id}] Error during Solid sync: {e}")
 
     def sync_data_from_solid(self):
         """Authenticates with the Solid Pod and downloads the latest training data."""
+        # Stagger auth attempts slightly to avoid thundering herd against the Solid server
+        time.sleep(random.uniform(0.0, 0.5))
         print(f"\n[Client {self.client_id}] Initiating Solid Pod Sync...")
         
         # Initialize our new auth client
@@ -173,12 +230,23 @@ class SwarmNode:
             
             test_dest = os.path.join(self.pod_dir, 'test.csv')
             solid_client.download_file("/swarm_data/test.csv", test_dest)
+            # Report which files were written (or missing)
+            for fname in ('train_common.csv', 'train_vulnerable.csv', 'test.csv'):
+                p = os.path.join(self.pod_dir, fname)
+                if os.path.exists(p):
+                    print(f"[Client {self.client_id}] Synced: {fname}")
+                else:
+                    print(f"[Client {self.client_id}] Missing after sync: {fname}")
         else:
             print(f"⚠️ [Client {self.client_id}] Solid Auth failed. Falling back to local offline data if available.")
 
     def train_local_epoch(self):
         # 1. READ BLOCKCHAIN STATE: Should we exclude vulnerable data?
-        exclude_vuln = self.contract.functions.excludeVulnerableData(self.wallet_address).call()
+        try:
+            exclude_vuln = self.contract.functions.excludeVulnerableData(self.wallet_address).call()
+        except Exception as e:
+            print(f"⚠️ [Client {self.client_id}] RPC Error fetching privacy preference, defaulting to True: {e}")
+            exclude_vuln = True
         status_msg = "EXCLUDING" if exclude_vuln else "INCLUDING"
         print(f"[Client {self.client_id}] Local training... Privacy Flag is {status_msg} vulnerable data.")
 
@@ -219,25 +287,31 @@ class SwarmNode:
         # 5. Format Data
         pos_recipes = train_df['recipe_id'].values % TOTAL_RECIPES
         pos_labels = (train_df['rating'].values >= 4).astype(float)
-        
-        # 6. Generate Strict Negative Samples
-        num_interactions = len(train_df)
-        #num_negatives = max(1, int(num_interactions * 2.0))
-        num_negatives = 0
-        neg_recipes_list = []
-        
-        while len(neg_recipes_list) < num_negatives:
-            rand_r = np.random.randint(0, TOTAL_RECIPES)
-            if rand_r not in global_seen_set:
-                neg_recipes_list.append(rand_r)
-                
-        neg_recipes = np.array(neg_recipes_list)
-        neg_labels = np.zeros(num_negatives) # Label as 0
-        
-        # 7. Combine positive and negative samples
+
+        # 6. Generate negative samples to create a balanced dataset
+        pos_count = len(pos_recipes)
+        num_negatives = pos_count if pos_count > 0 else 1
+
+        all_possible = np.arange(TOTAL_RECIPES)
+        seen_array = np.array(list(global_seen_set)) if len(global_seen_set) > 0 else np.array([], dtype=int)
+        valid_pool = np.setdiff1d(all_possible, seen_array)
+
+        if valid_pool.size == 0:
+            # fallback to random sampling with replacement across all recipes
+            neg_recipes = np.random.randint(0, TOTAL_RECIPES, size=num_negatives)
+        else:
+            replace = valid_pool.size < num_negatives
+            neg_recipes = np.random.choice(valid_pool, size=num_negatives, replace=replace)
+
+        neg_labels = np.zeros(len(neg_recipes), dtype=float)
+
+        # 7. Combine positive and negative samples and shuffle
         all_recipes = np.concatenate([pos_recipes, neg_recipes])
         all_labels = np.concatenate([pos_labels, neg_labels])
-        
+        perm = np.random.permutation(len(all_recipes))
+        all_recipes = all_recipes[perm]
+        all_labels = all_labels[perm]
+
         recipes_tensor = torch.tensor(all_recipes, dtype=torch.long)
         labels_tensor = torch.tensor(all_labels, dtype=torch.float32).unsqueeze(1)
 
@@ -245,27 +319,47 @@ class SwarmNode:
         dataloader = DataLoader(dataset, batch_size=64, shuffle=True)
 
         # 8. Training Loop
+        num_batches = max(1, math.ceil(len(dataset) / 64))
+        print(f"[Client {self.client_id}] Prepared training data: {len(dataset)} samples, {num_batches} batches.")
         self.model.train()
         total_loss = 0.0
 
         # 9. Take a snapshot of the global weights BEFORE the batch loop starts
         global_weights = {name: param.clone().detach() for name, param in self.model.named_parameters()}
-        mu = 0.01 # FedProx penalty hyperparameter
-        
+        mu = 0.01 # FedProx penalty hyperparameter (kept small)
+
+        # Use BCEWithLogitsLoss for numerical stability with logits output
+        pos = float(np.sum(all_labels == 1.0))
+        neg = float(np.sum(all_labels == 0.0))
+
+        pos_weight = 1.25
+        if pos <= 0.0:
+            pos_weight = torch.tensor(pos_weight)
+        else:
+            pos_weight = torch.tensor(max(1.0, neg / pos) * pos_weight)
+
+        local_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+        # Precompute normalization factor for proximal term
+        total_param_count = sum(p.numel() for name, p in self.model.named_parameters() if 'my_personal_embedding' not in name)
+
         for batch_recipes, batch_labels in dataloader:
             self.optimizer.zero_grad()
-            predictions = self.model(batch_recipes) 
-            base_loss = self.criterion(predictions, batch_labels)
-            
-            # Calculate the FedProx Penalty (L2 Norm)
+            predictions = self.model(batch_recipes).unsqueeze(1)
+            base_loss = local_criterion(predictions, batch_labels)
+
+            # Calculate the FedProx Penalty (squared L2 Norm), normalized
             proximal_term = 0.0
             for name, param in self.model.named_parameters():
-                # Only penalize the public recipe weights, not the private user embedding!
                 if 'my_personal_embedding' not in name:
-                    proximal_term += (param - global_weights[name]).norm(2)
-            
+                    gw = global_weights[name].to(param.device)
+                    proximal_term = proximal_term + torch.sum((param - gw) ** 2)
+
+            if total_param_count > 0:
+                proximal_term = proximal_term / float(total_param_count)
+
             # Add the penalty to the base loss
-            loss = base_loss + (mu / 2) * proximal_term
+            loss = base_loss + (mu / 2.0) * proximal_term
 
             loss.backward()
             #Prevent gradient explosion in the Highway Layers
@@ -291,7 +385,11 @@ class SwarmNode:
 
     def submit_to_swarm(self, swarm_id, epoch):
         # Fetch the user's DP Budget from the Smart Contract
-        scaled_dp_budget = self.contract.functions.dpBudgets(self.wallet_address).call()
+        try:
+            scaled_dp_budget = self.contract.functions.dpBudgets(self.wallet_address).call()
+        except Exception as e:
+            print(f"⚠️ [Client {self.client_id}] RPC Error fetching DP budget, defaulting to 0: {e}")
+            scaled_dp_budget = 0
         
         # Strip out the private embedding BEFORE saving
         state_dict = self.model.state_dict()
@@ -301,7 +399,6 @@ class SwarmNode:
         if scaled_dp_budget > 0:
             # Reverse the Solidity integer scaling back to a float
             epsilon = scaled_dp_budget / 100.0
-            #print(f"   [Client {self.client_id}] 🛡️ Applying DP Noise (Epsilon: {epsilon})...")
             
             # The standard deviation is inversely proportional to epsilon.
             # (Assuming a base sensitivity constant of 0.1 for the clipping bound)
@@ -328,21 +425,31 @@ class SwarmNode:
             base_tx['gas'] = int(gas_estimate * 1.2)
             
             tx = self.contract.functions.submitWeights(swarm_id, epoch, weights_uri).build_transaction(base_tx)
-            self.sign_and_send(tx)
+            receipt = self.sign_and_send(tx)
+            try:
+                print(f"[Client {self.client_id}] Submission receipt: {receipt.transactionHash.hex()}")
+            except Exception:
+                print(f"[Client {self.client_id}] Submission sent (no receipt details).")
         except Exception as e:
-            print(f"⚠️ [Client {self.client_id}] Submission rejected (Likely too late for Epoch {epoch}). Dropping local weights and preparing to sync.")
+            print(f"⚠️ [Client {self.client_id}] Submission rejected (Likely too late for Epoch {epoch}): {e}. Dropping local weights and preparing to sync.")
 
     def wait_for_consensus(self, swarm_id, epoch):
-        print(f"[Client {self.client_id}] Waiting for consensus on swarm {swarm_id}...")
+        print(f"[Client {self.client_id}] Waiting for consensus on swarm {swarm_id} (local epoch {epoch})...")
         import re
         
         while True:
-            swarm_data = self.contract.functions.swarms(swarm_id).call()
-            current_leader = swarm_data[2]
-            global_uri = swarm_data[3]     
+            try:
+                swarm_data = self.contract.functions.swarms(swarm_id).call()
+                current_leader = swarm_data[2]
+                global_uri = swarm_data[3]     
+            except Exception as e:
+                print(f"⚠️ [Client {self.client_id}] RPC Error polling consensus: {e}")
+                time.sleep(random.uniform(1.0, 3.0))
+                continue
             
             # Condition 1: We are the leader!
             if current_leader == self.wallet_address:
+                print(f"[Client {self.client_id}] I am the leader for epoch {epoch} (wallet {self.wallet_address}).")
                 self.execute_leader_duties(swarm_id, epoch)
                 return epoch + 1 # Move to the next epoch normally
                 
@@ -356,33 +463,54 @@ class SwarmNode:
                     # If the network is AT or AHEAD of us, grab the latest weights to catch up!
                     if global_epoch >= epoch:
                         print(f"[Client {self.client_id}] Global model at Epoch {global_epoch} found. Downloading...")
-                        global_state = torch.load(global_uri, weights_only=True)
-                        
-                        # strict=False tells PyTorch to only update the public recipe weights
-                        self.model.load_state_dict(global_state, strict=False)
-                        # FAST-FORWARD: Return the global epoch + 1 so the local loop catches up instantly!
-                        return global_epoch + 1 
+
+                        # --- THE FIX: Replaced File Tokens with safe Jitter ---
+                        # Prevent all nodes from trying to read the `.pt` file simultaneously
+                        time.sleep(random.uniform(0.1, 3.0))
+
+                        try:
+                            global_state = torch.load(global_uri, weights_only=True)
+                            # strict=False tells PyTorch to only update the public recipe weights
+                            self.model.load_state_dict(global_state, strict=False)
+                            # FAST-FORWARD: Return the global epoch + 1 so the local loop catches up instantly!
+                            return global_epoch + 1
+                        except Exception as load_err:
+                            print(f"⚠️ [Client {self.client_id}] Failed to load global model: {load_err}. Retrying...")
             
             time.sleep(2)
 
     def execute_leader_duties(self, swarm_id, epoch):
         print(f"[Client {self.client_id}] ELECTED LEADER ✅ for Swarm {swarm_id}! Aggregating weights...")
-        uris = self.contract.functions.getAllWeightsUris(swarm_id).call()
+        try:
+            uris = self.contract.functions.getAllWeightsUris(swarm_id).call()
+        except Exception as e:
+            print(f"⚠️ [Client {self.client_id}] Leader RPC Error fetching URIs: {e}")
+            return
+            
+        # Filter to only current epoch to prevent memory leaks if contract doesn't clear
+        uris = [uri for uri in uris if f"_e{epoch}.pt" in uri]
+        if not uris:
+            print(f"⚠️ [Client {self.client_id}] No valid URIs found for epoch {epoch}. Skipping aggregation.")
+            return
         
         # Federated Averaging (FedAvg)
         aggregated_state = None
 
         for uri in uris:
-            state = torch.load(uri, weights_only=True)
-            if aggregated_state is None:
-                aggregated_state = state
-            else:
-                for key in aggregated_state.keys():
-                    aggregated_state[key] += state[key]
-            
-            # Clear memory immediately
-            del state      
-            gc.collect()   
+            try:
+                state = torch.load(uri, weights_only=True)
+                if aggregated_state is None:
+                    aggregated_state = state
+                else:
+                    for key in aggregated_state.keys():
+                        aggregated_state[key] += state[key]
+                
+                # Clear memory immediately
+                del state      
+                gc.collect()   
+            except Exception as e:
+                print(f"⚠️ [Client {self.client_id}] Leader failed to read client weight file at {uri}: {e}")
+                continue
                     
         for key in aggregated_state.keys():
             aggregated_state[key] = torch.div(aggregated_state[key], len(uris))
@@ -394,17 +522,20 @@ class SwarmNode:
 
         # Submit back to blockchain
         print(f"[Client {self.client_id}] Submitting aggregated global model for Swarm {swarm_id}...")
-        base_tx = {
-            'from': self.wallet_address,
-            'nonce': self.w3.eth.get_transaction_count(self.wallet_address),
-            'gasPrice': self.w3.eth.gas_price
-        }
-        # Estimate gas dynamically (especially important for the leader loop that resets all node states)
-        gas_estimate = self.contract.functions.submitGlobalModel(swarm_id, global_uri).estimate_gas(base_tx)
-        base_tx['gas'] = int(gas_estimate * 1.2)
-        
-        tx = self.contract.functions.submitGlobalModel(swarm_id, global_uri).build_transaction(base_tx)
-        self.sign_and_send(tx)
+        try:
+            base_tx = {
+                'from': self.wallet_address,
+                'nonce': self.w3.eth.get_transaction_count(self.wallet_address),
+                'gasPrice': self.w3.eth.gas_price
+            }
+            # Estimate gas dynamically (especially important for the leader loop that resets all node states)
+            gas_estimate = self.contract.functions.submitGlobalModel(swarm_id, global_uri).estimate_gas(base_tx)
+            base_tx['gas'] = int(gas_estimate * 1.2)
+            
+            tx = self.contract.functions.submitGlobalModel(swarm_id, global_uri).build_transaction(base_tx)
+            self.sign_and_send(tx)
+        except Exception as e:
+            print(f"⚠️ [Client {self.client_id}] Failed to submit global model: {e}")
         
         # strict=False ensures the leader doesn't overwrite its own private taste vector!
         self.model.load_state_dict(aggregated_state, strict=False)
@@ -422,7 +553,12 @@ class SwarmNode:
             return
             
         train_df = pd.read_csv(train_path) if os.path.exists(train_path) else pd.DataFrame(columns=['recipe_id'])
-        exclude_vuln = self.contract.functions.excludeVulnerableData(self.wallet_address).call()
+        
+        try:
+            exclude_vuln = self.contract.functions.excludeVulnerableData(self.wallet_address).call()
+        except Exception:
+            exclude_vuln = True
+
         if not exclude_vuln and os.path.exists(vuln_path):
             vuln_df = pd.read_csv(vuln_path)
             train_df = pd.concat([train_df, vuln_df], ignore_index=True)
@@ -436,10 +572,11 @@ class SwarmNode:
         y_true = (test_df['rating'].values >= 4).astype(float)
         
         with torch.no_grad():
-            preds = self.model(recipes_tensor).squeeze().numpy()
-            if preds.ndim == 0:
-                preds = np.expand_dims(preds, 0)
-            y_pred = (preds >= 0.5).astype(float)
+            logits = self.model(recipes_tensor).squeeze()
+            probs = torch.sigmoid(logits).numpy()
+            if probs.ndim == 0:
+                probs = np.expand_dims(probs, 0)
+            y_pred = (probs >= 0.5).astype(float)
             
         cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
         tn, fp, fn, tp = cm.ravel()
@@ -461,9 +598,28 @@ class SwarmNode:
             df.to_csv(metrics_path, mode='a', header=False, index=False)
 
         print(f"   [Client {self.client_id}] Evaluated Epoch {epoch} and saved metrics to pod.")
+        # --- ROC-AUC Curve (classification) ---
+        try:
+            if len(np.unique(y_true)) > 1:
+                auc = roc_auc_score(y_true, probs)
+                fpr, tpr, _ = roc_curve(y_true, probs)
+                roc_path = os.path.join(self.pod_dir, f"roc_epoch_{epoch}.png")
+                plt.figure()
+                plt.plot(fpr, tpr, label=f'AUC = {auc:.4f}')
+                plt.plot([0, 1], [0, 1], linestyle='--', color='gray')
+                plt.xlabel('False Positive Rate')
+                plt.ylabel('True Positive Rate')
+                plt.title(f'ROC Curve - Client {self.client_id} Epoch {epoch}')
+                plt.legend(loc='lower right')
+                plt.tight_layout()
+                plt.savefig(roc_path)
+                plt.close()
+                print(f"   [Client {self.client_id}] ROC-AUC: {auc:.4f} saved to {roc_path}")
+        except Exception as e:
+            print(f"   [Client {self.client_id}] Could not compute ROC-AUC: {e}")
 
     def evaluate_final_ranking(self):
-        """Runs the heavy Top-N evaluation only once at the end of training."""
+        """Runs the heavy Top-N evaluation using Actual Negatives first, then padding with Randoms."""
         print(f"   [Client {self.client_id}] Running Final Top-{TOP_N} Ranking Evaluation...")
         test_path = os.path.join(self.pod_dir, 'test.csv')
         train_path = os.path.join(self.pod_dir, 'train_common.csv')
@@ -478,8 +634,15 @@ class SwarmNode:
         train_df = pd.read_csv(train_path) if os.path.exists(train_path) else pd.DataFrame(columns=['recipe_id'])
         self.model.eval()
         
+        # 1. Build the sets of what to include/exclude
         seen_recipes = set(test_df['recipe_id'].values % TOTAL_RECIPES).union(set(train_df['recipe_id'].values % TOTAL_RECIPES))
+        
+        # Split test set into Actual Positives and Actual Negatives
         liked_test_df = test_df[test_df['rating'] >= 4]
+        disliked_test_df = test_df[test_df['rating'] < 4]
+        
+        # Extract unique actual negative IDs
+        actual_test_negatives = np.unique(disliked_test_df['recipe_id'].values % TOTAL_RECIPES)
         
         client_hits = 0
         client_ndcg = 0
@@ -488,24 +651,46 @@ class SwarmNode:
         if total_ranking_tests == 0:
             return
 
-        # Vectorized negative generation for speed
+        # 2. Build the backup pool of Random Negatives (Recipes never seen)
         all_possible_recipes = np.arange(TOTAL_RECIPES)
         seen_array = np.array(list(seen_recipes))
         valid_negatives_pool = np.setdiff1d(all_possible_recipes, seen_array)
-        
+
         with torch.no_grad():
             for index, row in liked_test_df.iterrows():
-                true_recipe = torch.tensor([row['recipe_id'] % TOTAL_RECIPES], dtype=torch.long)
-                
-                fake_recipes_array = np.random.choice(valid_negatives_pool, NUM_NEGATIVE_SAMPLES, replace=False)
+                true_id = int(row['recipe_id'] % TOTAL_RECIPES)
+                true_recipe = torch.tensor([true_id], dtype=torch.long)
+
+                # 3. Smart Negative Sampling Logic
+                if len(actual_test_negatives) >= NUM_NEGATIVE_SAMPLES:
+                    # Scenario A: We have enough Actual Negatives in the test set
+                    fake_recipes_array = np.random.choice(actual_test_negatives, NUM_NEGATIVE_SAMPLES, replace=False)
+                else:
+                    # Scenario B: Take ALL Actual Negatives, then pad with Random Negatives
+                    fake_from_test = actual_test_negatives
+                    shortfall = NUM_NEGATIVE_SAMPLES - len(actual_test_negatives)
+                    
+                    if valid_negatives_pool.size >= shortfall:
+                        fake_from_pool = np.random.choice(valid_negatives_pool, shortfall, replace=False)
+                    else:
+                        # Extreme edgecase: Almost no valid pool left (highly unlikely with 500k recipes)
+                        reps = int(np.ceil(shortfall / max(1, valid_negatives_pool.size)))
+                        fake_from_pool = np.tile(valid_negatives_pool, reps)[:shortfall]
+                        
+                    fake_recipes_array = np.concatenate([fake_from_test, fake_from_pool])
+
                 fake_recipes = torch.tensor(fake_recipes_array, dtype=torch.long)
-                
                 all_recipes = torch.cat([true_recipe, fake_recipes])
+
+                # 4. Scoring and Ranking
+                scores = torch.sigmoid(self.model(all_recipes)).squeeze().numpy()
                 
-                scores = self.model(all_recipes).squeeze().numpy()
+                if scores.ndim == 0:
+                    scores = np.expand_dims(scores, 0)
+                    
                 ranked_indices = scores.argsort()[::-1]
                 rank_of_true_item = (ranked_indices == 0).nonzero()[0][0]
-                
+
                 if rank_of_true_item < TOP_N:
                     client_hits += 1
                     client_ndcg += 1.0 / math.log2(rank_of_true_item + 2)
@@ -517,7 +702,7 @@ class SwarmNode:
         }
         
         pd.DataFrame([ranking_metrics]).to_csv(os.path.join(self.pod_dir, 'final_ranking.csv'), index=False)
-        print(f"   [Client {self.client_id}] Final ranking metrics saved.")
+        print(f"   [Client {self.client_id}] Final ranking metrics saved (Used {len(actual_test_negatives)} actual negatives per test).")
 
     def run(self):
         self.sync_data_from_solid()
@@ -531,7 +716,16 @@ class SwarmNode:
         patience = 2
         min_delta = 0.0001
         global_swarm_id = 0
-        current_epoch = 0
+        # Allow resuming from environment variable START_EPOCH (exported by master_swarm_fix.sh)
+        try:
+            env_start = os.environ.get('START_EPOCH', None)
+            current_epoch = int(env_start) if env_start is not None else 0
+        except Exception:
+            current_epoch = 0
+
+        if current_epoch >= TOTAL_EPOCHS:
+            print(f"[Client {self.client_id}] START_EPOCH={current_epoch} >= TOTAL_EPOCHS={TOTAL_EPOCHS}. Nothing to run.")
+            return
         
         while current_epoch < TOTAL_EPOCHS:
             best_loss = float('inf')
