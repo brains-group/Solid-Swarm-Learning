@@ -79,7 +79,7 @@ class DecentralizedFoodRecommender(nn.Module):
     def forward(self, recipe_idx):
         r = self.recipe_embedding(recipe_idx)
         # THE FIX: Fetch the independent bias/popularity score
-        b = self.recipe_bias(recipe_idx).squeeze() 
+        b = self.recipe_bias(recipe_idx).squeeze(-1) 
         
         batch_size = r.size(0)
         u = self.my_personal_embedding.expand(batch_size, -1)
@@ -89,11 +89,15 @@ class DecentralizedFoodRecommender(nn.Module):
         
         # Highway Path (Feature interaction)
         x = torch.cat([u, r], dim=1)
+        
+        # THE FIX: Apply Dropout BEFORE the highway layers so we don't zero out 
+        # features that get permanently carried forward by the Highway residual gates.
+        x = self.dropout(x)
+        
         for layer in self.highway_layers:
             x = layer(x)
-            x = self.dropout(x)
             
-        mlp_score = self.output(x).squeeze()
+        mlp_score = self.output(x).squeeze(-1)
         
         # THE FIX: Final Score = Interaction (MLP) + Similarity (Dot) + Popularity (Bias)
         # Return raw logits; apply sigmoid at inference/time of thresholding.
@@ -189,8 +193,8 @@ class SwarmNode:
 
         # ML setup
         self.model = DecentralizedFoodRecommender()
-        # Reduce LR for stability
-        self.optimizer = optim.Adam(self.model.parameters(), lr=5e-4, weight_decay=1e-5)
+        # THE FIX: Remove weight_decay to prevent Adam from applying dense regularizations to sparse embeddings
+        self.optimizer = optim.Adam(self.model.parameters(), lr=5e-4)
         self.criterion = FocalLoss(alpha=0.05, gamma=2.0)
 
         # Signal that initialization finished (helps diagnose hangs during model construction)
@@ -332,33 +336,36 @@ class SwarmNode:
         pos = float(np.sum(all_labels == 1.0))
         neg = float(np.sum(all_labels == 0.0))
 
-        pos_weight = 1.25
+        pos_weight = 1.12
         if pos <= 0.0:
             pos_weight = torch.tensor(pos_weight)
         else:
-            pos_weight = torch.tensor(max(1.0, neg / pos) * pos_weight)
+             # THE FIX: Clamp the pos_weight to prevent massive gradient spikes
+             # from clients with extremely rare positive interactions.
+             pos_weight = torch.tensor(min((neg / pos) * pos_weight, 15.0))
 
         local_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-        # Precompute normalization factor for proximal term
-        total_param_count = sum(p.numel() for name, p in self.model.named_parameters() if 'my_personal_embedding' not in name)
 
         for batch_recipes, batch_labels in dataloader:
             self.optimizer.zero_grad()
             predictions = self.model(batch_recipes).unsqueeze(1)
             base_loss = local_criterion(predictions, batch_labels)
 
-            # Calculate the FedProx Penalty (squared L2 Norm), normalized
+            # Calculate the FedProx Penalty (squared L2 Norm)
             proximal_term = 0.0
+            unique_recipes = torch.unique(batch_recipes)
             for name, param in self.model.named_parameters():
                 if 'my_personal_embedding' not in name:
                     gw = global_weights[name].to(param.device)
-                    proximal_term = proximal_term + torch.sum((param - gw) ** 2)
+                    if 'recipe_embedding' in name or 'recipe_bias' in name:
+                        # THE FIX: Only penalize the recipes present in this batch!
+                        # Applying FedProx to the entire 500k embedding table causes Adam to 
+                        # apply momentum updates to completely unrelated recipes, destroying learning.
+                        proximal_term = proximal_term + torch.sum((param[unique_recipes] - gw[unique_recipes]) ** 2)
+                    else:
+                        proximal_term = proximal_term + torch.sum((param - gw) ** 2)
 
-            if total_param_count > 0:
-                proximal_term = proximal_term / float(total_param_count)
-
-            # Add the penalty to the base loss
+            # Add the penalty to the base loss (Removed the massive division by 32 Million param count)
             loss = base_loss + (mu / 2.0) * proximal_term
 
             loss.backward()
@@ -393,7 +400,8 @@ class SwarmNode:
         
         # Strip out the private embedding BEFORE saving
         state_dict = self.model.state_dict()
-        public_weights_only = {k: v for k, v in state_dict.items() if 'my_personal_embedding' not in k}
+        # THE FIX: Use .clone() so we don't apply DP noise directly to our in-memory model!
+        public_weights_only = {k: v.clone() for k, v in state_dict.items() if 'my_personal_embedding' not in k}
         
         # Apply Local Differential Privacy (Continuous Epsilon)
         if scaled_dp_budget > 0:

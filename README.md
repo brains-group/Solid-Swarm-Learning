@@ -113,5 +113,8 @@ This script helps start back up any previous run that crashed mid-training.
 
 ### Other Scripts
 
--   `python3 learning/data/src monitor_swarm.py' can be used to keep track of current training progress
--   `python3 learning/data/src evaluate_swarm.py' can be used to observe current epoch learning direction, as well as rerun final metrics
+-   cd learning/data/src
+-   `python3 monitor_swarm.py' can be used to keep track of current training progress
+-   `python3 evaluate_swarm.py' can be used to observe current epoch learning direction, as well as rerun final metrics
+-   'python3 toggle_dp.py client_num val' can be used to change a cilent's local Differential Privacy Value
+-   'python3 toggle_privacy.py client_num include/exclude' can be used to toggle whether a client's vulnerable data is included within swarm learning
