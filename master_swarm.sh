@@ -42,6 +42,13 @@ if [ -d "$GLOBAL_DATA_DIR" ]; then
     find "$GLOBAL_DATA_DIR" -maxdepth 1 -type f -name "*.pt" -exec rm -f {} + 2>/dev/null || true
 fi
 
+# Wipe old local client weights to ensure a completely fresh start
+PODS_DATA_DIR="learning/data/pods"
+if [ -d "$PODS_DATA_DIR" ]; then
+    echo "🧹 Cleaning any existing local client .pt models..."
+    find "$PODS_DATA_DIR" -type f -name "*.pt" -exec rm -f {} + 2>/dev/null || true
+fi
+
 # Extract Number of Clients from Python config
 CONFIG_FILE="learning/data/src/config.py"
 if [ -f "$CONFIG_FILE" ]; then
@@ -91,7 +98,7 @@ cd ..
 
 echo "▶️ [2/9] Booting Anvil Blockchain..."
 cd swarm_orchestrator
-anvil > ../anvil.log 2>&1 &
+anvil --block-time 1 --gas-limit 3000000000 > ../anvil.log 2>&1 &
 cd ..
 
 # HEARTBEAT CHECK

@@ -45,7 +45,7 @@ class SolidTokenClient:
                 resp = self.session.post(token_endpoint, data=token_data, auth=auth, headers=headers, timeout=20)
             except RequestException as e:
                 wait = (2 ** (attempt - 1)) + random.random() * 0.5
-                print(f"   [Solid Auth] ✗ Connection error when contacting {token_endpoint} (attempt {attempt}/{max_retries}): {e}. Retrying in {wait:.1f}s")
+                print(f"   [Solid Auth] ✗ Connection error when contacting {token_endpoint} (attempt {attempt}/{max_retries}): {e} (client id: {self.token_id}). Retrying in {wait:.1f}s")
                 time.sleep(wait)
                 resp = None
 

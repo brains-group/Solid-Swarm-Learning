@@ -146,7 +146,7 @@ cd ..
 
 echo "▶️ [2/9] Booting Anvil Blockchain..."
 cd swarm_orchestrator
-anvil > ../anvil.log 2>&1 &
+anvil --block-time 1 --gas-limit 3000000000 > ../anvil.log 2>&1 &
 cd ..
 
 # HEARTBEAT CHECK

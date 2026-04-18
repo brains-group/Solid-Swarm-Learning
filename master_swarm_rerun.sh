@@ -41,6 +41,20 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "🚀 Initiating the True Master Swarm Orchestrator..."
 
+# Wipe old global models for a fresh start
+GLOBAL_DATA_DIR="learning/data/global"
+if [ -d "$GLOBAL_DATA_DIR" ]; then
+    echo "🧹 Cleaning any existing global .pt models..."
+    find "$GLOBAL_DATA_DIR" -maxdepth 1 -type f -name "*.pt" -exec rm -f {} + 2>/dev/null || true
+fi
+
+# Wipe old local client weights
+PODS_DATA_DIR="learning/data/pods"
+if [ -d "$PODS_DATA_DIR" ]; then
+    echo "🧹 Cleaning any existing local client .pt models..."
+    find "$PODS_DATA_DIR" -type f -name "*.pt" -exec rm -f {} + 2>/dev/null || true
+fi
+
 # Extract Number of Clients from Python config
 CONFIG_FILE="learning/data/src/config.py"
 if [ -f "$CONFIG_FILE" ]; then
@@ -89,7 +103,7 @@ cd ..
 
 echo "▶️ [2/7] Booting Anvil Blockchain..."
 cd swarm_orchestrator
-anvil --block-time 0.5 > ../anvil.log 2>&1 &
+anvil --block-time 1 --gas-limit 3000000000 > ../anvil.log 2>&1 &
 cd ..
 
 # HEARTBEAT CHECK
@@ -127,6 +141,9 @@ echo "▶️ [5/7] Configuring Swarm Privacy, DP & Vulnerability Toggles..."
 # This registers the privacy state on the blockchain for each Pod
 for i in $(seq 1 "$NUM_CLIENTS"); do
     python3 toggle_dp.py "$i" 10.0 > /dev/null 2>&1
+    if (( i % 2 == 0 )); then
+        python3 toggle_privacy.py "$i" exclude > /dev/null 2>&1
+    fi
     echo "✅ DP & Vulnerability values set for Pod $i"
     # Optional: toggle_vulnerability.py "$i" 0 (if you have a toggle script for vulnerability)
 done
