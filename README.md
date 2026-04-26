@@ -1,11 +1,11 @@
 # General Swarm - Decentralized Recommender System
 
-This project implements a decentralized machine learning system for building a general recommendation model using Swarm Learning. In this demo we showcase it via both a food and movie dataset. The system is orchestrated by a Solidity smart contract on an Ethereum-like blockchain (Anvil) and executed by a network of Python-based client nodes to store the data via a network of Solid Pods.
+This project implements a decentralized machine learning system for building a general recommendation model using Swarm Learning. In this demo we showcase it using the ml-32m movie review dataset collected from MovieLens. The system is orchestrated by a Solidity smart contract on an Ethereum-like blockchain (Anvil) and executed by a network of Python-based client nodes to store the data via a network of Solid Pods.
 
 ## Project Structure
 
 ```
-food_swarm_project/
+Solid-Swarm_Learning/
 ├── swarm_orchestrator/         # Foundry smart contract project
 │   ├── src/
 │   │   └── SwarmCoordinator.sol # The core smart contract that manages swarm registration, epoch tracking, weight submission, leader election, vulnerability status, and global model updates.
@@ -47,7 +47,7 @@ food_swarm_project/
 The lifecycle of this decentralized network operates in distinct phases:
 
 ### 1. Data Partitioning & Registration
-The global dataset, which is sourced from Food.com (https://www.kaggle.com/datasets/shuyangli94/food-com-recipes-and-user-interactions)  is partitioned into isolated client directories, simulating individual Solid Pods. Each client is assigned a cryptographic wallet, funded with test ETH, and is registered to the Swarm via an Ethereum Smart Contract. The clients are also given control of a single Solid Pod through a private and public key token pair, which they use to store and access their data.
+The global dataset, which is sourced from MovieLens.com (https://grouplens.org/datasets/movielens/32m/) is partitioned into isolated client directories, simulating individual Solid Pods. Each client is assigned a cryptographic wallet, funded with test ETH, and is registered to the Swarm via an Ethereum Smart Contract. The clients are also given control of a single Solid Pod through a private and public key token pair, which they use to store and access their data.
 
 ### 2. The Privacy Split & Weight Submission
 When an epoch finishes, the private user embedding is stripped out and saved securely in the Pod, and only the public recipe weights are packaged and submitted to the blockchain. The Smart Contract enforces strict epoch checking to ensure nodes that submit their updates late do not corrupt the developed model.
