@@ -65,6 +65,7 @@ Because evaluation cannot happen centrally without compromising privacy, evaluat
 - Node.js and npm (for the Solid server in `solid_backend`)
 - Foundry tooling (Forge / Anvil) for local EVM testing
 - tmux (optional, used by master scripts)
+- PodOS, which can be downloaded on github (https://github.com/pod-os/PodOS)
 - the ml-32m dataset created by MovieLens (https://grouplens.org/datasets/movielens/), saved within learning/data/global in its own folder called ml-32m
 
 See the `learning/requirements.txt` for the full Python dependency list. The repository contains orchestration scripts under the project root and Python code under `learning/data/src/`.

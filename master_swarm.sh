@@ -84,14 +84,15 @@ fi
 trap 'echo -e "\n🛑 Shutting down background servers..."; kill $(jobs -p) 2>/dev/null; exit' EXIT
 
 echo "🧹 Clearing ghost processes..."
-lsof -ti:3000,3001,8545 | xargs kill -9 2>/dev/null || true
+lsof -ti:3000,3001,3333,8545 | xargs kill -9 2>/dev/null || true
 sleep 2
 
 # --- PHASE 1: INFRASTRUCTURE ---
 
 echo "▶️ [1/9] Booting Solid Server..."
 cd solid_backend
-rm -rf my-solid-data .internal
+# THE FIX: Added 'data', '*.sqlite', and '*.db' to ensure total amnesia
+rm -rf my-solid-data .internal data *.sqlite *.db
 npm run build > /dev/null 2>&1
 nvm exec 20 node --require cross-fetch/polyfill dist/SolidApplication.js > ../solid.log 2>&1 &
 cd ..
@@ -118,10 +119,142 @@ echo -e "\n✅ Solid Server is UP!"
 
 # --- PHASE 2: SETUP ---
 
+
+echo "▶️ [2.5/9] Starting PodOS environment..."
+
+# 1. Load NVM
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+ORIGINAL_DIR=$(pwd)
+cd PodOS || { echo "Error: PodOS folder not found!"; exit 1; }
+
+nvm install 20 > /dev/null 2>&1
+nvm use 20 > /dev/null 2>&1
+
+hash -r
+unalias npm 2>/dev/null
+unalias node 2>/dev/null
+
+NODE_BIN=$(nvm which 20)
+NODE_DIR=$(dirname "$NODE_BIN")
+export PATH="$NODE_DIR:$PATH"
+
+# 2. Delete old logs ONLY (Removed the rm -rf deep clean!)
+rm -f core.log elements.log install.log
+
+echo "Installing PodOS dependencies (silently)..."
+env CI=true npm ci --no-progress --loglevel=error > install.log 2>&1
+
+# 3. Boot Core
+echo "Booting PodOS core..."
+npm run dev:core < /dev/null > core.log 2>&1 &
+
+echo "⏳ Waiting for PodOS core to finish building..."
+MAX_WAIT=60
+WAIT_COUNT=0
+while ! grep -q "build finished" core.log 2>/dev/null; do
+    printf "."
+    sleep 2
+    WAIT_COUNT=$((WAIT_COUNT+2))
+    if [ $WAIT_COUNT -ge $MAX_WAIT ]; then
+        echo -e "\n❌ ERROR: PodOS core timeout. Check core.log"
+        exit 1
+    fi
+done
+echo -e "\n✅ PodOS core built successfully!"
+
+# 4. Boot Elements (UI)
+echo "Booting PodOS elements (UI)..."
+npm run dev:elements < /dev/null > elements.log 2>&1 &
+
+# 5. THE HTTP 200 SNIPER
+# This holds the script until the server explicitly proves the JS file is ready!
+echo "⏳ Waiting for StencilJS routing engine to mount JS bundles..."
+WAIT_COUNT=0
+while [ $(curl -s -o /dev/null -w "%{http_code}" http://localhost:3333/build/pos-app-browser.entry.js) -ne 200 ]; do
+    printf "."
+    sleep 2
+    WAIT_COUNT=$((WAIT_COUNT+2))
+    if [ $WAIT_COUNT -ge $MAX_WAIT ]; then
+        echo -e "\n❌ ERROR: PodOS UI timeout. The JS bundles never mounted."
+        exit 1
+    fi
+done
+
+echo -e "\n✅ PodOS UI Javascript bundles are fully mapped and serving!"
+
+cd "$ORIGINAL_DIR"
+
+# end of PodOS setup
+
 echo "▶️ [3/9] Generating Solid Accounts..."
 cd solid_backend/scripts
 node --require cross-fetch/polyfill --dns-result-order=ipv4first create_accounts.js
 cd ../..
+
+# --- NEW STEP 3.5 ---
+echo "▶️ [3.5/9] Attempting to open user1's Pod in an Incognito/Private Browser..."
+
+# URL-encoded target URI: http://localhost:3000/user1/
+USER1_POD_URI="http%3A%2F%2Flocalhost%3A3000%2Fuser1%2F"
+PODOS_TARGET_URL="http://localhost:3333/?uri=$USER1_POD_URI"
+
+# Helper function to quietly attempt running absolute paths
+try_path() {
+    "$@" > /dev/null 2>&1
+    return $?
+}
+
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    # --- macOS ---
+    # Try generic application calls first
+    open -na "Google Chrome" --args --incognito "$PODOS_TARGET_URL" 2>/dev/null || \
+    open -na "Firefox" --args --private-window "$PODOS_TARGET_URL" 2>/dev/null || \
+    open -na "Brave Browser" --args --incognito "$PODOS_TARGET_URL" 2>/dev/null || \
+    open -na "Microsoft Edge" --args --inprivate "$PODOS_TARGET_URL" 2>/dev/null || \
+    # Fallback to absolute application paths
+    try_path /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --incognito "$PODOS_TARGET_URL" || \
+    try_path /Applications/Firefox.app/Contents/MacOS/firefox --private-window "$PODOS_TARGET_URL" || \
+    # Ultimate fallback
+    open "$PODOS_TARGET_URL"
+
+elif [[ -n "$WSL_DISTRO_NAME" || "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || "$OSTYPE" == "win32" ]]; then
+    # --- Windows (Native or via WSL) ---
+    # Try Windows command aliases first
+    cmd.exe /c start chrome --incognito "$PODOS_TARGET_URL" 2>/dev/null || \
+    cmd.exe /c start firefox -private-window "$PODOS_TARGET_URL" 2>/dev/null || \
+    cmd.exe /c start msedge -inprivate "$PODOS_TARGET_URL" 2>/dev/null || \
+    # Fallback to common absolute Windows paths (useful if WSL aliases fail)
+    try_path "/mnt/c/Program Files/Google/Chrome/Application/chrome.exe" --incognito "$PODOS_TARGET_URL" || \
+    try_path "/mnt/c/Program Files/Mozilla Firefox/firefox.exe" -private-window "$PODOS_TARGET_URL" || \
+    try_path "/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe" -inprivate "$PODOS_TARGET_URL" || \
+    # Ultimate fallback
+    explorer.exe "$PODOS_TARGET_URL"
+
+else
+    # --- Native Linux ---
+    # Check for specific binaries and launch them silently in the background
+    if command -v google-chrome-stable >/dev/null 2>&1; then
+        google-chrome-stable --incognito "$PODOS_TARGET_URL" &
+    elif command -v google-chrome >/dev/null 2>&1; then
+        google-chrome --incognito "$PODOS_TARGET_URL" &
+    elif command -v firefox >/dev/null 2>&1; then
+        firefox --private-window "$PODOS_TARGET_URL" &
+    elif command -v brave-browser >/dev/null 2>&1; then
+        brave-browser --incognito "$PODOS_TARGET_URL" &
+    elif command -v chromium-browser >/dev/null 2>&1; then
+        chromium-browser --incognito "$PODOS_TARGET_URL" &
+    elif command -v chromium >/dev/null 2>&1; then
+        chromium --incognito "$PODOS_TARGET_URL" &
+    elif command -v xdg-open >/dev/null 2>&1; then
+        echo "⚠️ Could not find a specific browser for incognito mode. Falling back to standard tab."
+        xdg-open "$PODOS_TARGET_URL" &
+    else
+        echo "❌ No browser launch command found. Please open manually: $PODOS_TARGET_URL"
+    fi
+fi
+# --------------------
 
 echo "▶️ [4/9] Deploying Smart Contracts..."
 cd swarm_orchestrator
