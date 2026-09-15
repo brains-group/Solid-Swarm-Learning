@@ -17,6 +17,9 @@ import torch.nn.functional as F
 import math
 from sklearn.metrics import confusion_matrix, roc_auc_score, roc_curve
 import matplotlib.pyplot as plt
+import asyncio
+import websockets
+import requests
 
 torch.set_num_threads(1)
 
@@ -27,7 +30,6 @@ ABI_PATH = "../../../swarm_orchestrator/out/SwarmCoordinator.sol/SwarmCoordinato
 GLOBAL_DIR = "../global"
 PODS_DIR = "../pods" 
 
-
 GENRE_MAP = {
     'Action': 1, 'Adventure': 2, 'Animation': 3, 'Children': 4, 
     'Comedy': 5, 'Crime': 6, 'Documentary': 7, 'Drama': 8, 'Fantasy': 9, 
@@ -35,6 +37,13 @@ GENRE_MAP = {
     'Sci-Fi': 15, 'Thriller': 16, 'War': 17, 'Western': 18, 'IMAX': 19, 
     '(no genres listed)': 0, '': 0
 }
+
+def log_notification(client_id, message):
+    log_path = os.path.join(Path(__file__).resolve().parents[3], "notifications.log")
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    log_entry = f"[{timestamp}] [Client {client_id}] {message}\n"
+    with open(log_path, "a") as f:
+        f.write(log_entry)
 
 def genre_collate_fn(batch):
     recipes = []
@@ -51,9 +60,7 @@ def genre_collate_fn(batch):
     offsets = torch.tensor(offsets[:-1], dtype=torch.long)
     recipes = torch.tensor(recipes, dtype=torch.long)
     labels = torch.tensor(labels, dtype=torch.float32).unsqueeze(1)
-    
     genres_tensor = torch.tensor(all_genres, dtype=torch.long) if all_genres else torch.empty(0, dtype=torch.long)
-    
     return recipes, genres_tensor, offsets, labels
 
 class RecipeGenreDataset(Dataset):
@@ -93,7 +100,6 @@ class DecentralizedFoodRecommender(nn.Module):
         nn.init.kaiming_uniform_(self.recipe_embedding.weight)
         nn.init.zeros_(self.recipe_bias.weight)
 
-        # NeuMF Width: User Embed + Recipe Embed + Element-wise Interaction
         input_dim = embedding_dim * 3
         self.highway_layers = nn.ModuleList([
             HighwayLayer(input_dim) for _ in range(num_highway_layers)
@@ -105,16 +111,12 @@ class DecentralizedFoodRecommender(nn.Module):
     def forward(self, recipe_idx, genre_indices, genre_offsets):
         r_pre = self.recipe_embedding(recipe_idx)
         g = self.genre_embedding(genre_indices, genre_offsets)
-        r = r_pre + g # Content-injected recipe embedding
-
+        r = r_pre + g 
         b = self.recipe_bias(recipe_idx).squeeze(-1) 
         batch_size = r.size(0)
         u = self.my_personal_embedding.expand(batch_size, -1)
         
-        # Matrix Factorization (Dot Product)
         dot_product = (u * r).sum(dim=1)
-        
-        # Neural Collaborative Filtering Path
         dot_interaction = u * r 
         x = torch.cat([u, r, dot_interaction], dim=1) 
         
@@ -124,14 +126,6 @@ class DecentralizedFoodRecommender(nn.Module):
             
         mlp_score = self.output(x).squeeze(-1)
         return mlp_score + dot_product + b
-
-class WeightedBCELoss(nn.Module):
-    def __init__(self, pos_weight=1.0):
-        super(WeightedBCELoss, self).__init__()
-        self.criterion = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight]))
-
-    def forward(self, inputs, targets):
-        return self.criterion(inputs, targets)
 
 class SwarmNode:
     def __init__(self, client_id):
@@ -177,7 +171,6 @@ class SwarmNode:
             )
 
         self.model = DecentralizedFoodRecommender()
-        # THE FIX: Apply weight decay ONLY to the Highway and Output layers to prevent runaway positive logits
         self.optimizer = optim.Adam([
             {'params': self.model.my_personal_embedding, 'weight_decay': 0.0},
             {'params': self.model.recipe_embedding.parameters(), 'weight_decay': 0.0},
@@ -187,8 +180,6 @@ class SwarmNode:
             {'params': self.model.output.parameters(), 'weight_decay': 1e-4}
         ], lr=5e-4)
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(self.optimizer, T_max=TOTAL_EPOCHS, eta_min=1e-5)
-
-        # Removed sync_data_from_solid() from __init__ to prevent the thundering herd lockup.
         print(f"[Client {self.client_id}] Initialized model and environment (pid={os.getpid()}).")
 
     def sync_data_from_solid(self):
@@ -197,37 +188,40 @@ class SwarmNode:
             if os.path.exists(p):
                 os.remove(p)
 
-        # 2. Deterministic Modulo Scaffolding
-        # We group the 150 clients into 15 buckets.
-        # Clients 1, 16, 31... are in Bucket 1 (Wait 2.0s)
-        # Clients 2, 17, 32... are in Bucket 2 (Wait 4.0s)
-        # This guarantees exactly 10 clients wake up every 2 seconds.
         bucket = self.client_id % 15
-        
-        # Multiply the bucket by a 2.0 second spacing interval
         stagger_time = bucket * 2.0 
+        print(f"\n[Client {self.client_id}] Staggering Solid Pod Sync by {stagger_time:.1f}s (Bucket {bucket})...")
         
-        print(f"\n[Client {self.client_id}] Staggering Solid Pod Sync by {stagger_time:.1f}s (Bucket {bucket}) to avoid server overload...")
-        time.sleep(stagger_time)
-        
-        solid_client = SolidTokenClient(
-            pod_url=self.solid_url,
-            username=self.solid_username,
-            token_id=self.solid_token_id,
-            token_secret=self.solid_token_secret
-        )
-        
-        if solid_client.authenticate():
-            common_dest = os.path.join(self.pod_dir, 'train_common.csv')
-            solid_client.download_file("/swarm_data/train_common.csv", common_dest)
+        try:
+            time.sleep(stagger_time)
+            solid_client = SolidTokenClient(
+                pod_url=self.solid_url, username=self.solid_username,
+                token_id=self.solid_token_id, token_secret=self.solid_token_secret
+            )
             
-            vuln_dest = os.path.join(self.pod_dir, 'train_vulnerable.csv')
-            solid_client.download_file("/swarm_data/train_vulnerable.csv", vuln_dest)
-            
-            test_dest = os.path.join(self.pod_dir, 'test.csv')
-            solid_client.download_file("/swarm_data/test.csv", test_dest)
-        else:
-            print(f"⚠️ [Client {self.client_id}] Solid Auth failed. Falling back to local offline data if available.")
+            if solid_client.authenticate():
+                auth_headers = solid_client.session.headers.copy()
+                files_to_download = {
+                    'train_common.csv': "/swarm_data/train_common.csv",
+                    'train_vulnerable.csv': "/swarm_data/train_vulnerable.csv",
+                    'test.csv': "/swarm_data/test.csv"
+                }
+                for filename, pod_path in files_to_download.items():
+                    target_url = f"{self.solid_url}{pod_path}"
+                    dest_path = os.path.join(self.pod_dir, filename)
+                    try:
+                        res = requests.get(target_url, headers=auth_headers, timeout=10)
+                        if res.status_code == 200:
+                            with open(dest_path, 'wb') as f:
+                                f.write(res.content)
+                        else:
+                            print(f"⚠️ [Client {self.client_id}] Failed to download {filename}: Code {res.status_code}")
+                    except Exception as e:
+                        print(f"⚠️ [Client {self.client_id}] Timeout downloading {filename}: {e}")
+            else:
+                print(f"⚠️ [Client {self.client_id}] Solid Auth failed. Falling back to local offline data.")
+        except Exception as e:
+            print(f"❌ [Client {self.client_id}] Critical failure during sync: {e}")
 
     def train_local_epoch(self):
         try:
@@ -242,22 +236,15 @@ class SwarmNode:
         vuln_path = os.path.join(self.pod_dir, 'train_vulnerable.csv')
         test_path = os.path.join(self.pod_dir, 'test.csv')
         
-        if not os.path.exists(common_path):
-            return
-
+        if not os.path.exists(common_path): return
         train_df = pd.read_csv(common_path)
         if not exclude_vuln and os.path.exists(vuln_path):
-            vuln_df = pd.read_csv(vuln_path)
-            train_df = pd.concat([train_df, vuln_df], ignore_index=True)
-
-        if train_df.empty:
-            return
+            train_df = pd.concat([train_df, pd.read_csv(vuln_path)], ignore_index=True)
+        if train_df.empty: return
 
         global_seen_set = set(train_df['recipe_id'].values)
         if exclude_vuln and os.path.exists(vuln_path):
-            vuln_df = pd.read_csv(vuln_path)
-            global_seen_set.update(vuln_df['recipe_id'].values)
-            
+            global_seen_set.update(pd.read_csv(vuln_path)['recipe_id'].values)
         if os.path.exists(test_path):
             test_df = pd.read_csv(test_path)
             if not test_df.empty:
@@ -265,7 +252,6 @@ class SwarmNode:
 
         pos_recipes = train_df['recipe_id'].values % TOTAL_RECIPES
         pos_labels = (train_df['rating'].values >= 4).astype(float)
-
         pos_count = len(pos_recipes)
         num_negatives = pos_count * 1 if pos_count > 0 else 1
 
@@ -276,16 +262,13 @@ class SwarmNode:
         if valid_pool.size == 0:
             neg_recipes = np.random.randint(0, TOTAL_RECIPES, size=num_negatives)
         else:
-            replace = valid_pool.size < num_negatives
-            neg_recipes = np.random.choice(valid_pool, size=num_negatives, replace=replace)
+            neg_recipes = np.random.choice(valid_pool, size=num_negatives, replace=(valid_pool.size < num_negatives))
 
         neg_labels = np.zeros(len(neg_recipes), dtype=float)
-
         all_recipes = np.concatenate([pos_recipes, neg_recipes])
         all_labels = np.concatenate([pos_labels, neg_labels])
         perm = np.random.permutation(len(all_recipes))
-        all_recipes = all_recipes[perm]
-        all_labels = all_labels[perm]
+        all_recipes, all_labels = all_recipes[perm], all_labels[perm]
 
         local_genre_lookup = {}
         for _, row in train_df.iterrows():
@@ -294,7 +277,6 @@ class SwarmNode:
             local_genre_lookup[rec_id] = [GENRE_MAP.get(g.strip(), 0) for g in genre_str]
 
         all_genres_list = [local_genre_lookup.get(int(r_id), [0]) for r_id in all_recipes]
-
         dataset = RecipeGenreDataset(all_recipes, all_labels, all_genres_list)
         dataloader = DataLoader(dataset, batch_size=BATCH_SIZE_GLOBAL, shuffle=True, collate_fn=genre_collate_fn)
 
@@ -302,11 +284,6 @@ class SwarmNode:
         total_loss = 0.0
         global_weights = {name: param.clone().detach().to(param.device) for name, param in self.model.named_parameters()}
         mu = 0.01 
-
-        #pos = float(np.sum(all_labels == 1.0))
-        #neg = float(np.sum(all_labels == 0.0))
-        #pos_weight = min(neg / pos if pos > 0 else 1.0, 10.0)
-
         local_criterion = nn.BCEWithLogitsLoss()
 
         for batch_recipes, batch_genres, batch_offsets, batch_labels in dataloader:
@@ -320,9 +297,9 @@ class SwarmNode:
                 if 'my_personal_embedding' not in name:
                     gw = global_weights[name]
                     if 'recipe_embedding' in name or 'recipe_bias' in name:
-                        proximal_term = proximal_term + torch.sum((param[unique_recipes] - gw[unique_recipes]) ** 2)
+                        proximal_term += torch.sum((param[unique_recipes] - gw[unique_recipes]) ** 2)
                     else:
-                        proximal_term = proximal_term + torch.sum((param - gw) ** 2)
+                        proximal_term += torch.sum((param - gw) ** 2)
 
             loss = base_loss + (mu / 2.0) * proximal_term
             loss.backward()
@@ -339,7 +316,7 @@ class SwarmNode:
         tx_hash = self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
         receipt = self.w3.eth.wait_for_transaction_receipt(tx_hash)
         if receipt.status == 0:
-            raise Exception(f"Transaction reverted on-chain! Gas used: {receipt.gasUsed}. If it hit the limit, increase the gas.")
+            raise Exception(f"Transaction reverted on-chain! Gas used: {receipt.gasUsed}.")
         return receipt
 
     def submit_to_swarm(self, swarm_id, epoch):
@@ -369,40 +346,180 @@ class SwarmNode:
             }
             gas_estimate = self.contract.functions.submitWeights(swarm_id, epoch, weights_uri).estimate_gas(base_tx)
             base_tx['gas'] = int(gas_estimate * 1.2)
-            
             tx = self.contract.functions.submitWeights(swarm_id, epoch, weights_uri).build_transaction(base_tx)
             self.sign_and_send(tx)
         except Exception as e:
             print(f"⚠️ [Client {self.client_id}] Submission rejected (Likely too late for Epoch {epoch}): {e}")
 
     def wait_for_consensus(self, swarm_id, epoch):
-        import re
+        # 0. LEADER CHECK FIRST
+        try:
+            swarm_data = self.contract.functions.swarms(swarm_id).call()
+            if swarm_data[2] == self.wallet_address:
+                self.execute_leader_duties(swarm_id, epoch)
+                return epoch + 1
+        except Exception:
+            pass
+            
+        print(f"📡 [Client {self.client_id}] Waiting for consensus via WebSocket...")
+        
+        target_resource = f"{self.solid_url.rstrip('/')}/inbox/"
+        
+        solid_client = SolidTokenClient(
+            pod_url=self.solid_url, username=self.solid_username,
+            token_id=self.solid_token_id, token_secret=self.solid_token_secret
+        )
+        
+        auth_headers = {'Accept': 'application/ld+json'}
+        if solid_client.authenticate():
+            auth_headers.update(solid_client.session.headers.copy())
+            
+        # --- 1. W3C STORAGE DISCOVERY ---
+        from urllib.parse import urlparse
+        parsed = urlparse(self.solid_url)
+        server_root = f"{parsed.scheme}://{parsed.netloc}"
+        
+        # Safe default if Discovery fails (Notice the trailing slash!)
+        subscription_url = f"{server_root}/.notifications/WebSocketChannel2023/" 
+        
+        try:
+            # Correctly target the Server Root for discovery
+            description_url = f"{server_root}/.well-known/solid"
+            desc_response = requests.get(description_url, headers=auth_headers, timeout=5.0)
+            
+            if desc_response.status_code == 200:
+                desc_data = desc_response.json()
+                if "subscription" in desc_data:
+                    # Parse the array of supported channel types
+                    subs = desc_data["subscription"] if isinstance(desc_data["subscription"], list) else [desc_data["subscription"]]
+                    for sub in subs:
+                        if isinstance(sub, dict) and (sub.get("channelType") == "WebSocketChannel2023" or sub.get("type") == "WebSocketChannel2023"):
+                            subscription_url = sub.get("id", subscription_url)
+                            break
+            log_notification(self.client_id, f"Discovery routing to: {subscription_url}")
+                
+        except Exception as e:
+            log_notification(self.client_id, f"Discovery warning: {e}. Falling back to default URL.")
+
+        # --- 2. W3C 2023 SUBSCRIPTION NEGOTIATION ---
+        payload = {
+            "@context": ["https://www.w3.org/ns/solid/notification/v1"],
+            "type": "http://www.w3.org/ns/solid/notifications#WebSocketChannel2023",
+            "topic": target_resource
+        }
+        
+        post_headers = auth_headers.copy()
+        # MUST explicitly declare ld+json so the CSS router accepts the POST
+        post_headers['Content-Type'] = 'application/ld+json'
+
+        try:
+            # MUST use data=json.dumps to prevent 'requests' from overriding the Content-Type header
+            response = requests.post(subscription_url, data=json.dumps(payload), headers=post_headers, timeout=5.0)
+            
+            if response.status_code in [200, 201]:
+                channel_data = response.json()
+                ws_url = channel_data.get("receiveFrom")
+                if ws_url:
+                    log_notification(self.client_id, f"Channel allocated! Listening on: {ws_url}")
+                    asyncio.run(self.listen_for_global_update(ws_url, target_resource, swarm_id, epoch))
+                else:
+                    log_notification(self.client_id, "Server returned 200 but provided no 'receiveFrom' URL.")
+                    self.fallback_poll_consensus(swarm_id, epoch)
+            else:
+                log_notification(self.client_id, f"Subscription rejected. Code {response.status_code}: {response.text}")
+                self.fallback_poll_consensus(swarm_id, epoch)
+        except Exception as e:
+            log_notification(self.client_id, f"Subscription POST crashed: {e}")
+            self.fallback_poll_consensus(swarm_id, epoch)
+            
+        return epoch + 1
+
+
+    async def listen_for_global_update(self, ws_url, target_resource, swarm_id, epoch):
+        target_filename = f"global_model_s{swarm_id}_e{epoch}.pt"
+        global_uri = os.path.join(GLOBAL_DIR, target_filename)
+        
+        # --- 3. W3C 2023 CONNECTION ---
+        try:
+            async with websockets.connect(ws_url, ping_interval=None) as websocket:
+                log_notification(self.client_id, "WebSocket connected successfully. Awaiting JSON-LD stream.")
+                
+                while True:
+                    # Breakout 1: Periodic disk check
+                    if os.path.exists(global_uri):
+                        try:
+                            time.sleep(1.0)
+                            global_state = torch.load(global_uri, weights_only=True)
+                            self.model.load_state_dict(global_state, strict=False)
+                            log_notification(self.client_id, "Woke up via disk check.")
+                            return
+                        except Exception:
+                            pass
+
+                    # --- THE FIX: Breakout 2: Leader Check ---
+                    try:
+                        swarm_data = self.contract.functions.swarms(swarm_id).call()
+                        if swarm_data[2] == self.wallet_address:
+                            print(f"👑 [Client {self.client_id}] I am the Leader for Epoch {epoch}. Aggregating...")
+                            self.execute_leader_duties(swarm_id, epoch)
+                            return
+                    except Exception:
+                        pass
+                    # -----------------------------------------
+
+                    try:
+                        message = await asyncio.wait_for(websocket.recv(), timeout=5.0)
+                        log_notification(self.client_id, f"WS Message Received:\n{message}")
+                        
+                        notification = json.loads(message)
+                        event_type = notification.get("type", "")
+                        modified_resource = notification.get("object", "")
+                        
+                        if event_type in ["Update", "Add", "https://www.w3.org/ns/activitystreams#Update", "https://www.w3.org/ns/activitystreams#Add"]:
+                            if "/inbox/" in modified_resource:
+                                print(f"🔔 [Client {self.client_id}] WebSocket Ping: Inbox received update notification!")
+                                time.sleep(random.uniform(0.1, 3.0)) 
+                                try:
+                                    global_state = torch.load(global_uri, weights_only=True)
+                                    self.model.load_state_dict(global_state, strict=False)
+                                    return
+                                except Exception as e:
+                                    print(f"❌ [Client {self.client_id}] Failed to load notified weights: {e}")
+                    except asyncio.TimeoutError:
+                        continue 
+        except Exception as e:
+            log_notification(self.client_id, f"WebSocket crashed silently: {e}. Switching to fallback.")
+            self.fallback_poll_consensus(swarm_id, epoch)
+
+    def fallback_poll_consensus(self, swarm_id, epoch):
+        target_filename = f"global_model_s{swarm_id}_e{epoch}.pt"
+        global_uri = os.path.join(GLOBAL_DIR, target_filename)
+        
         while True:
+            # 1. FOLLOWER EXIT: Check if the leader finished aggregating and saved the file
+            if os.path.exists(global_uri):
+                try:
+                    time.sleep(1.0) # Ensure the file is completely written to disk
+                    global_state = torch.load(global_uri, weights_only=True)
+                    self.model.load_state_dict(global_state, strict=False)
+                    print(f"✅ [Client {self.client_id}] Fallback Poll: Loaded new global model!")
+                    return
+                except Exception:
+                    pass
+
+            # 2. LEADER EXIT: Check if this node was elected to aggregate
             try:
                 swarm_data = self.contract.functions.swarms(swarm_id).call()
                 current_leader = swarm_data[2]
-                global_uri = swarm_data[3]     
-            except Exception as e:
-                time.sleep(random.uniform(5.0, 10.0))
-                continue
-            
-            if current_leader == self.wallet_address:
-                self.execute_leader_duties(swarm_id, epoch)
-                return epoch + 1 
                 
-            elif global_uri:
-                match = re.search(r'_e(\d+)\.pt', global_uri)
-                if match:
-                    global_epoch = int(match.group(1))
-                    if global_epoch >= epoch:
-                        time.sleep(random.uniform(0.1, 3.0))
-                        try:
-                            global_state = torch.load(global_uri, weights_only=True)
-                            self.model.load_state_dict(global_state, strict=False)
-                            return global_epoch + 1
-                        except Exception:
-                            pass
-            time.sleep(2)
+                if current_leader == self.wallet_address:
+                    print(f"👑 [Client {self.client_id}] I am the Leader for Epoch {epoch}. Aggregating...")
+                    self.execute_leader_duties(swarm_id, epoch)
+                    return
+            except Exception:
+                pass
+                
+            time.sleep(5.0)
 
     def execute_leader_duties(self, swarm_id, epoch):
         try:
@@ -434,6 +551,37 @@ class SwarmNode:
         os.makedirs(GLOBAL_DIR, exist_ok=True)
         torch.save(aggregated_state, global_uri)
 
+        # --- P2P SOLID INBOX BROADCAST (Privacy Preserving) ---
+        solid_client = SolidTokenClient(
+            pod_url=self.solid_url, username=self.solid_username,
+            token_id=self.solid_token_id, token_secret=self.solid_token_secret
+        )
+        
+        if solid_client.authenticate():
+            auth_headers = solid_client.session.headers.copy()
+            auth_headers['Content-Type'] = 'text/plain' 
+            
+            try:
+                accounts_path = Path(__file__).resolve().parents[3] / 'secret' / 'user_accounts.json'
+                with open(accounts_path, 'r') as f:
+                    all_accounts = json.load(f)
+
+                for user_key, acct in all_accounts.items():
+                    target_pod_url = acct.get('pod')
+                    if not target_pod_url or target_pod_url == self.solid_url:
+                        continue 
+                    
+                    inbox_url = f"{target_pod_url}/inbox/"
+                    try:
+                        res = requests.post(inbox_url, data=f"Epoch {epoch} complete.", headers=auth_headers, timeout=5.0)
+                        if res.status_code in [200, 201]:
+                            log_notification(self.client_id, f"LEADER: Sent ping to {user_key}'s Inbox.")
+                    except Exception:
+                        pass
+                print(f"📢 [Leader {self.client_id}] Broadcasted Notifications to all swarm inboxes!")
+            except Exception as e:
+                print(f"⚠️ [Leader {self.client_id}] Failed to parse accounts for P2P Broadcast: {e}")
+
         try:
             base_tx = {
                 'from': self.wallet_address,
@@ -442,7 +590,6 @@ class SwarmNode:
             }
             gas_estimate = self.contract.functions.submitGlobalModel(swarm_id, global_uri).estimate_gas(base_tx)
             base_tx['gas'] = int(gas_estimate * 1.2)
-            
             tx = self.contract.functions.submitGlobalModel(swarm_id, global_uri).build_transaction(base_tx)
             self.sign_and_send(tx)
         except Exception:
@@ -456,7 +603,6 @@ class SwarmNode:
         vuln_path = os.path.join(self.pod_dir, 'train_vulnerable.csv')
         
         if not os.path.exists(test_path): return
-            
         test_df = pd.read_csv(test_path)
         if test_df.empty: return
             
@@ -472,7 +618,6 @@ class SwarmNode:
             train_df = pd.concat([train_df, vuln_df], ignore_index=True)
             
         self.model.eval()
-
         local_genre_lookup = {}
         for df in [train_df, test_df]:
             if not df.empty and 'genres' in df.columns:
@@ -504,7 +649,6 @@ class SwarmNode:
         tn, fp, fn, tp = cm.ravel()
         
         metrics = {'epoch': epoch, 'tp': int(tp), 'tn': int(tn), 'fp': int(fp), 'fn': int(fn)}
-        
         metrics_path = os.path.join(self.pod_dir, 'metrics.csv')
         df = pd.DataFrame([metrics])
         if not os.path.exists(metrics_path):
@@ -517,7 +661,6 @@ class SwarmNode:
         train_path = os.path.join(self.pod_dir, 'train_common.csv')
         
         if not os.path.exists(test_path): return
-            
         test_df = pd.read_csv(test_path)
         if test_df.empty: return
             
@@ -533,7 +676,6 @@ class SwarmNode:
                     local_genre_lookup[rec_id] = [GENRE_MAP.get(g.strip(), 0) for g in genre_str]
         
         seen_recipes = set(test_df['recipe_id'].values % TOTAL_RECIPES).union(set(train_df['recipe_id'].values % TOTAL_RECIPES))
-        
         liked_test_df = test_df[test_df['rating'] >= 4]
         disliked_test_df = test_df[test_df['rating'] < 4]
         actual_test_negatives = np.unique(disliked_test_df['recipe_id'].values % TOTAL_RECIPES)
@@ -541,7 +683,6 @@ class SwarmNode:
         client_hits = 0
         client_ndcg = 0
         total_ranking_tests = len(liked_test_df)
-        
         if total_ranking_tests == 0: return
 
         all_possible_recipes = np.arange(TOTAL_RECIPES)
@@ -551,7 +692,6 @@ class SwarmNode:
         with torch.no_grad():
             for index, row in liked_test_df.iterrows():
                 true_id = int(row['recipe_id'] % TOTAL_RECIPES)
-                
                 if len(actual_test_negatives) >= NUM_NEGATIVE_SAMPLES:
                     fake_recipes_array = np.random.choice(actual_test_negatives, NUM_NEGATIVE_SAMPLES, replace=False)
                 else:
@@ -592,7 +732,6 @@ class SwarmNode:
         pd.DataFrame([ranking_metrics]).to_csv(os.path.join(self.pod_dir, 'final_ranking.csv'), index=False)
 
     def run(self):
-        # 1. Sync is now performed here in the run loop to respect the orchestrator's concurrency limits
         self.sync_data_from_solid()
 
         metrics_path = os.path.join(self.pod_dir, 'metrics.csv')

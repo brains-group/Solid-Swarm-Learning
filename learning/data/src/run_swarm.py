@@ -20,37 +20,15 @@ class Logger(object):
         self.terminal.flush()
         self.log.flush()
 
-def run_client(client_id, compute_semaphore, network_semaphore):
+def run_client(client_id):
     """Worker function to initialize and run a single Swarm Edge Node safely."""
     try:
         print(f"[Worker] Spawning client {client_id} (pid={os.getpid()})...")
         sys.stdout.flush()
 
         node = SwarmNode(client_id=client_id)
-
-        # --- FIX 1: Protect the RAM (Compute Lock) ---
-        original_train = node.train_local_epoch
-
-        def throttled_train():
-            print(f"⏳ [Client {client_id}] Waiting for an open PyTorch compute slot...")
-            with compute_semaphore:
-                print(f"🚀 [Client {client_id}] Slot acquired! Starting heavy local training...")
-                return original_train()
-
-        node.train_local_epoch = throttled_train
-
-        # --- FIX 2: Protect the Solid Server (Network Lock) ---
-        # This prevents the CSS from dropping connections under heavy load
-        original_sync = node.sync_data_from_solid
-
-        def throttled_sync():
-            print(f"🌐 [Client {client_id}] Waiting for an open Solid Server connection...")
-            with network_semaphore:
-                return original_sync()
-
-        node.sync_data_from_solid = throttled_sync
-
-        # Run the standard lifecycle 
+        
+        # Simply run the node. Solid WebSockets now handle the flow natively.
         node.run()
 
     except Exception as e:
@@ -58,27 +36,20 @@ def run_client(client_id, compute_semaphore, network_semaphore):
 
 if __name__ == "__main__":
     sys.stdout = Logger()
-    print("🚀 Initializing Dual-Protected Swarm Learning network...")
-
-    # Lock 1: Allows only configured number of processes to do PyTorch math
-    compute_semaphore = multiprocessing.Semaphore(MAX_CONCURRENT_CLIENTS)
-    
-    # Lock 2: Allows only 10 clients to ping the Solid Server simultaneously
-    # Adjust this up to 15 or 20 if your CSS instance can handle the I/O
-    network_semaphore = multiprocessing.Semaphore(MAX_CONCURRENT_CLIENTS) 
+    print("🚀 Initializing Decentralized Swarm Learning network...")
     
     processes = []
 
-    # Launch all clients. They will immediately hit the network_semaphore and queue up gracefully.
+    # Launch all clients
     for i in range(1, NUM_ACTIVE_CLIENTS + 1):
-        p = multiprocessing.Process(target=run_client, args=(i, compute_semaphore, network_semaphore))
+        p = multiprocessing.Process(target=run_client, args=(i,))
         p.start()
         processes.append(p)
         
         # A tiny mechanical jitter to prevent process-spawning collisions
         time.sleep(0.1)
 
-    # Wait for all processes to formally conclude their 50 epochs
+    # Wait for all processes to formally conclude their epochs
     for p in processes:
         p.join()
         

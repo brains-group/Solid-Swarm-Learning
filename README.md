@@ -53,7 +53,14 @@ The global dataset, which is sourced from MovieLens.com (https://grouplens.org/d
 When an epoch finishes, the private user embedding is stripped out and saved securely in the Pod, and only the public recipe weights are packaged and submitted to the blockchain. The Smart Contract enforces strict epoch checking to ensure nodes that submit their updates late do not corrupt the developed model.
 
 ### 3. Leader Election & Global Aggregation
-Once the Smart Contract detects that an 80% consensus threshold has been reached, it dynamically elects a Leader node. The Leader downloads the public weights and submits the new Global Model back to the blockchain. All the pending nodes then download this global intelligence and begin the next epoch.
+Once the Smart Contract detects that an 80% consensus threshold has been reached, it dynamically elects a Leader node. The Leader node (polling the blockchain as a lightweight control-plane mechanism) aggregates the public weights and saves the new Global Model to disk. 
+
+### 4. Decentralized Event Signaling (W3C Solid Notifications Protocol)
+To completely eliminate centralized file-server polling and minimize network I/O, the swarm utilizes the 2023 W3C Solid Notifications Protocol. 
+* During initialization, each client dynamically discovers and negotiates a unique, ephemeral `WebSocketChannel2023` connection via their Pod's Storage Description.
+* Clients sit idle on these WebSockets, listening to their own secure `/inbox/` container.
+* When the elected Leader finishes aggregating the global model, it uses its *own* credentials to broadcast a lightweight JSON-LD text ping directly into every follower's inbox.
+* The Community Solid Server instantly pushes this event through the open WebSockets, waking the sleeping clients exactly when the data is ready for the next epoch.
 
 ### 5. Edge Evaluation
 Because evaluation cannot happen centrally without compromising privacy, evaluation (for now) is performed entirely on the edge. Each Pod wakes up, loads the latest global model and its private state, and calculates its own ranking metrics.

@@ -1,6 +1,6 @@
 # Global Configuration for Swarm Learning Project
 
-NUM_ACTIVE_CLIENTS = 100
+NUM_ACTIVE_CLIENTS = 50
 TOTAL_EPOCHS = 50
 ROUNDS_PER_EPOCH = 3
 
